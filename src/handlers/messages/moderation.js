@@ -1,38 +1,49 @@
+// src/handlers/messages/moderation.js
 const GroupSettings = require('../../models/GroupSettings');
-const UserWarning = require('../../models/UserWarning');
+const UserWarning   = require('../../models/UserWarning');
 const { normalizeArabic, hasLink, isMediaMessage } = require('../../lib/arabic');
-const { normalizeUserJid } = require('../../lib/jid');
 const logger = require('../../lib/logger');
 
-const notAdminCooldown = new Map();
+const notAdminCooldown = new Map(); // groupId -> lastTs
 
-async function isGroupAdmin(sock, groupId, userJidRaw) {
-  try {
-    const me = normalizeUserJid(userJidRaw);
-    const md = await sock.groupMetadataMinimal(groupId); // أخف وأضمن
-    const admins = (md?.participants || [])
-      .filter(p => p.admin)
-      .map(p => normalizeUserJid(p.id));
-    return admins.includes(me);
-  } catch (e) {
-    logger.warn({ e, groupId }, 'isGroupAdmin failed');
-    return false;
-  }
+function textFromMessage(msg) {
+  return (
+    msg?.message?.conversation ||
+    msg?.message?.extendedTextMessage?.text ||
+    msg?.message?.imageMessage?.caption ||
+    msg?.message?.videoMessage?.caption ||
+    ''
+  ).trim();
 }
 
-async function deleteForAll(sock, m) {
+/**
+ * نحاول حذف الرسالة مباشرةً. لو فشلنا 403/forbidden -> نُبلغ مرة واحدة كل 10 دقائق.
+ */
+async function deleteForAllOrWarn(sock, m) {
+  const groupId = m.key.remoteJid;
   try {
-    await sock.sendMessage(m.key.remoteJid, {
+    await sock.sendMessage(groupId, {
       delete: {
-        remoteJid: m.key.remoteJid,
+        remoteJid: groupId,
         fromMe: false,
         id: m.key.id,
-        participant: m.key.participant || m.participant,
+        participant: m.key.participant || m.participant, // مهم في القروبات
       }
     });
     return true;
   } catch (e) {
-    logger.warn({ e }, 'deleteForAll failed');
+    const msg = String(e?.message || '').toLowerCase();
+    const code = e?.data || e?.output?.statusCode;
+    if (code === 403 || msg.includes('forbidden') || msg.includes('not-authorized')) {
+      const last = notAdminCooldown.get(groupId) || 0;
+      const now  = Date.now();
+      if (now - last > 10 * 60 * 1000) {
+        await sock.sendMessage(groupId, { text: '⚠️ لتفعيل الحذف/الحظر يرجى ترقية البوت إلى *مشرف*.' });
+        notAdminCooldown.set(groupId, now);
+      }
+    } else {
+      logger.warn({ e }, 'deleteForAll failed');
+    }
     return false;
   }
 }
@@ -45,6 +56,7 @@ async function warnAndMaybeKick(sock, groupId, userId, settings) {
     { upsert: true, new: true }
   );
   const count = doc.count;
+
   if (count >= maxW) {
     try {
       await sock.groupParticipantsUpdate(groupId, [userId], 'remove');
@@ -61,58 +73,49 @@ async function warnAndMaybeKick(sock, groupId, userId, settings) {
   }
 }
 
-function textFromMessage(msg) {
-  return (
-    msg?.message?.conversation ||
-    msg?.message?.extendedTextMessage?.text ||
-    msg?.message?.imageMessage?.caption ||
-    msg?.message?.videoMessage?.caption ||
-    ''
-  ).trim();
-}
-
 async function moderateGroupMessage(sock, m) {
   const groupId = m.key?.remoteJid;
   if (!groupId?.endsWith('@g.us')) return false;
 
+  // إعدادات القروب
   const settings = await GroupSettings.findOne({ groupId }).lean().catch(() => null);
   if (!settings?.enabled) return false;
 
-  const meJid = sock.user?.id;
-  const amIAdmin = await isGroupAdmin(sock, groupId, meJid);
-
-  if (!amIAdmin) {
-    const now = Date.now();
-    if ((now - (notAdminCooldown.get(groupId) || 0)) > 600000) {
-      await sock.sendMessage(groupId, { text: '⚠️ لتفعيل الحذف/الحظر يجب ترقية البوت إلى *مشرف*.' });
-      notAdminCooldown.set(groupId, now);
-    }
-    return false;
-  }
-
-  const raw = textFromMessage(m);
+  // نص الرسالة
+  const raw  = textFromMessage(m);
   const norm = normalizeArabic(raw);
-  const fromUser = normalizeUserJid(m.key.participant || m.participant || '');
 
+  // مرسل الرسالة (قد يأتي كـ participant في القروبات)
+  const fromUser = m.key?.participant || m.participant;
+  if (!fromUser) return false;
+
+  // فحص المخالفات
+  const violations = [];
+
+  // روابط
   if (settings.blockLinks && hasLink(raw)) {
-    if (await deleteForAll(sock, m)) await warnAndMaybeKick(sock, groupId, fromUser, settings);
-    return true;
+    violations.push('روابط');
   }
 
+  // وسائط
   if (settings.blockMedia && isMediaMessage(m)) {
-    if (await deleteForAll(sock, m)) await warnAndMaybeKick(sock, groupId, fromUser, settings);
-    return true;
+    violations.push('وسائط');
   }
 
+  // كلمات محظورة (contains بعد التطبيع)
   if (Array.isArray(settings.bannedWords) && settings.bannedWords.length) {
     const hit = settings.bannedWords.some(w => norm.includes(normalizeArabic(w)));
-    if (hit) {
-      if (await deleteForAll(sock, m)) await warnAndMaybeKick(sock, groupId, fromUser, settings);
-      return true;
-    }
+    if (hit) violations.push('كلمة محظورة');
   }
 
-  return false;
+  if (!violations.length) return false;
+
+  // نحذف ثم نُحذّر/نطرد
+  const deleted = await deleteForAllOrWarn(sock, m);
+  if (deleted) {
+    await warnAndMaybeKick(sock, groupId, fromUser, settings);
+  }
+  return deleted;
 }
 
 module.exports = { moderateGroupMessage };
