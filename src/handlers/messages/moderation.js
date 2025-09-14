@@ -28,7 +28,6 @@ async function getAdminsNumbersCached(sock, groupId) {
   }
 
   try {
-    // minimal أخف عادةً ويحتوي admin flag في أغلب إصدارات Baileys
     const md = await sock.groupMetadataMinimal(groupId);
     const admins = (md?.participants || [])
       .filter(p => p?.admin)
@@ -38,7 +37,7 @@ async function getAdminsNumbersCached(sock, groupId) {
     adminsCache.set(groupId, { ts: now, adminsNumbers: set });
     return set;
   } catch (e) {
-    logger.warn({ e, groupId }, 'getAdminsNumbersCached failed; trying full metadata');
+    logger.warn({ e, groupId }, 'getAdminsNumbersCached minimal failed; trying full');
     try {
       const md2 = await sock.groupMetadata(groupId);
       const admins = (md2?.participants || [])
@@ -48,7 +47,7 @@ async function getAdminsNumbersCached(sock, groupId) {
       adminsCache.set(groupId, { ts: now, adminsNumbers: set });
       return set;
     } catch (e2) {
-      logger.warn({ e2, groupId }, 'getAdminsNumbersCached full metadata failed');
+      logger.warn({ e2, groupId }, 'getAdminsNumbersCached full failed');
       const empty = new Set();
       adminsCache.set(groupId, { ts: now, adminsNumbers: empty });
       return empty;
@@ -88,14 +87,9 @@ async function deleteForAllOrWarn(sock, m) {
   }
 }
 
-async function warnAndMaybeKick(sock, groupId, userId, settings) {
-  const maxW = settings.maxWarnings || 3;
-  const doc = await UserWarning.findOneAndUpdate(
-    { groupId, userId },
-    { $inc: { count: 1 } },
-    { upsert: true, new: true }
-  );
-  const count = doc.count;
+async function warnAndMaybeKick(sock, groupId, userId, settings, currentCount) {
+  const count   = currentCount;                // العدد بعد الزيادة
+  const maxW    = settings.maxWarnings || 3;
 
   if (count >= maxW) {
     try {
@@ -106,10 +100,17 @@ async function warnAndMaybeKick(sock, groupId, userId, settings) {
         mentions: [userId]
       });
     } catch (e) {
+      // لو البوت ليس مشرفًا سيُمنع من الطرد — نبلغ مرة واحدة كل 10 دقائق
+      const last = notAdminCooldown.get(groupId) || 0;
+      const now  = Date.now();
+      if (now - last > 10 * 60 * 1000) {
+        await sock.sendMessage(groupId, { text: '⚠️ لا أستطيع الحظر بدون صلاحية *مشرف*.' });
+        notAdminCooldown.set(groupId, now);
+      }
       logger.warn({ e }, 'kick user failed');
     }
   } else {
-    await sock.sendMessage(groupId, { text: `⚠️ تحذير ${count}/${maxW}: الرجاء الالتزام بالقوانين.` });
+    await sock.sendMessage(groupId, { text: `⚠️ المخالفة ${count}/${maxW}: الرجاء الالتزام بالقوانين.` });
   }
 }
 
@@ -117,56 +118,53 @@ async function moderateGroupMessage(sock, m) {
   const groupId = m.key?.remoteJid;
   if (!groupId?.endsWith('@g.us')) return false;
 
-  // إعدادات القروب
   const settings = await GroupSettings.findOne({ groupId }).lean().catch(() => null);
   if (!settings?.enabled) return false;
 
-  // المرسل (قد يأتي @lid) -> طبع إلى s.whatsapp + bareNumber للمقارنة
   const fromUserJid = normalizeUserJid(m.key?.participant || m.participant || '');
   if (!fromUserJid) return false;
   const fromBare = bareNumber(fromUserJid);
 
-  // استثناء المشرفين؟ (افتراضيًا نعم)
-  const exemptAdmins = settings.exemptAdmins !== false;
+  // استثناء المشرفين (افتراضيًا مغلق؛ فعّل من DB إذا رغبت)
+  const exemptAdmins = settings.exemptAdmins === true;
   if (exemptAdmins) {
     const adminsNumbers = await getAdminsNumbersCached(sock, groupId);
-    if (adminsNumbers.has(fromBare)) {
-      // مشرف؛ تخطَّى أي حظر
-      return false;
-    }
+    if (adminsNumbers.has(fromBare)) return false;
   }
 
-  // نص الرسالة
   const raw  = textFromMessage(m);
   const norm = normalizeArabic(raw);
 
-  // فحص المخالفات
-  const violations = [];
-
-  // روابط
-  if (settings.blockLinks && hasLink(raw)) {
-    violations.push('روابط');
-  }
-
-  // وسائط
-  if (settings.blockMedia && isMediaMessage(m)) {
-    violations.push('وسائط');
-  }
-
-  // كلمات محظورة (contains بعد التطبيع)
-  if (Array.isArray(settings.bannedWords) && settings.bannedWords.length) {
+  // تحديد المخالفة
+  let violated = false;
+  if (settings.blockLinks && hasLink(raw)) violated = true;
+  if (!violated && settings.blockMedia && isMediaMessage(m)) violated = true;
+  if (!violated && Array.isArray(settings.bannedWords) && settings.bannedWords.length) {
     const hit = settings.bannedWords.some(w => norm.includes(normalizeArabic(w)));
-    if (hit) violations.push('كلمة محظورة');
+    if (hit) violated = true;
+  }
+  if (!violated) return false;
+
+  // ✳️ التعديل المحوري: زد العدّاد دائمًا حتى لو فشل الحذف
+  let newCount = 1;
+  try {
+    const doc = await UserWarning.findOneAndUpdate(
+      { groupId, userId: fromUserJid },
+      { $inc: { count: 1 } },
+      { upsert: true, new: true }
+    );
+    newCount = doc?.count || 1;
+  } catch (e) {
+    logger.warn({ e }, 'warn counter inc failed');
   }
 
-  if (!violations.length) return false;
+  // حاول حذف الرسالة (إن أمكن)
+  await deleteForAllOrWarn(sock, m);
 
-  // نحذف ثم نُحذّر/نطرد
-  const deleted = await deleteForAllOrWarn(sock, m);
-  if (deleted) {
-    await warnAndMaybeKick(sock, groupId, fromUserJid, settings);
-  }
-  return deleted;
+  // أرسل التحذير/أطرد إن استوفى الحد
+  await warnAndMaybeKick(sock, groupId, fromUserJid, settings, newCount);
+
+  return true;
 }
 
 module.exports = { moderateGroupMessage };
