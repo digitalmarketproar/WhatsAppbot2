@@ -1,7 +1,7 @@
 // commands/hi.js
 module.exports = {
   name: "مرحبا",
-  aliases: ["هلا", "اهلا", "أهلا", "أهلاً", "اهلاً", "السلام"],
+  aliases: ["الووو",],
   run: async ({ sock, msg }) => {
     const chatId = msg.key.remoteJid;
     const text = [
