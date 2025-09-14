@@ -10,7 +10,12 @@ async function createWhatsApp({ telegram } = {}) {
     version,
     auth: state,
     printQRInTerminal: !telegram,
-    logger
+    logger,
+    emitOwnEvents: false,
+    syncFullHistory: false,
+    shouldSyncHistoryMessage: false,
+    markOnlineOnConnect: false,
+    getMessage: async () => undefined
   });
 
   sock.ev.on('creds.update', saveCreds);
@@ -18,8 +23,8 @@ async function createWhatsApp({ telegram } = {}) {
     try {
       if (u.qr && telegram?.sendQR) telegram.sendQR(u.qr);
       logger.info({ connection: u.connection, lastDisconnect: !!u.lastDisconnect }, 'connection.update');
-    } catch(e) {
-      logger.warn({ e }, 'connection.update handler warn');
+    } catch (e) {
+      logger.warn({ e }, 'connection.update warn');
     }
   });
 
