@@ -71,11 +71,12 @@ function resolveCommandName(firstToken, reg) {
 function onMessageUpsert(sock) {
   return async ({ messages }) => {
     const reg = ensureRegistry();
+
     for (const m of (messages || [])) {
       try {
         const chatId = m.key?.remoteJid;
         if (!chatId) continue;
-        if (m.key?.fromMe) continue;
+        if (m.key?.fromMe) continue;               // لا نعيد الرد على أنفسنا
         if (chatId === 'status@broadcast') continue;
 
         // قائمة التجاهل
@@ -83,43 +84,56 @@ function onMessageUpsert(sock) {
         const ignored = await IgnoreChat.findOne({ $or: [{ chatId }, { chatId: bare }, { bare }] }).lean().catch(() => null);
         if (ignored) continue;
 
-        const isGroup = chatId.endsWith('@g.us');
-        if (isGroup) {
-          // إدارة فقط داخل القروبات
+        // نص الرسالة
+        const rawText  = extractText(m);
+        const textNorm = normalizeArabic(rawText);
+
+        // داخل القروبات:
+        if (chatId.endsWith('@g.us')) {
+          // أمر "id" فقط داخل القروب
+          if (textNorm === 'id' || textNorm === 'المعرف') {
+            await sock.sendMessage(chatId, { text: `🆔 معرف هذا القروب:\n\`${chatId}\`` }, { quoted: m });
+            continue;
+          }
+          // خلاف ذلك: إدارة فقط (حذف/تحذير/طرد)
           await moderateGroupMessage(sock, m);
           continue;
         }
 
-        // خاص: أوامر + قاموس
-        const rawText   = extractText(m);
+        // من هنا: خاص فقط — الأوامر والقاموس
         if (!rawText) continue;
-        const textNorm  = normalizeArabic(rawText);
+
         const firstWord = textNorm.split(' ')[0] || '';
         let handled = false;
 
+        // أوامر بلا بادئة
         const cmdName = resolveCommandName(firstWord, reg);
         if (cmdName) {
-          const args = rawText.split(/\s+/).slice(1);
+          const args = rawText.split(/\s+/).slice(1); // نستخدم النص الأصلي للأرجومنتس
           await reg.commands.get(cmdName)({ sock, msg: m, args });
           handled = true;
         }
 
+        // مساعدة
         if (!handled && (textNorm === 'مساعده' || textNorm === 'help')) {
           const help = require('../../commands/help.js');
           await help.run({ sock, msg: m, args: [] });
           handled = true;
         }
 
+        // قاموس مطابق تمامًا
         if (!handled) {
           const r1 = matchExactKeyword(textNorm);
           if (r1) { await sock.sendMessage(chatId, { text: r1 }, { quoted: m }); handled = true; }
         }
 
+        // contains ذكي
         if (!handled) {
           const r2 = matchContains(textNorm);
           if (r2) { await sock.sendMessage(chatId, { text: r2 }, { quoted: m }); handled = true; }
         }
 
+        // intents عامة
         if (!handled) {
           const r3 = matchIntent(textNorm);
           if (r3) { await sock.sendMessage(chatId, { text: r3 }, { quoted: m }); handled = true; }
