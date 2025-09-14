@@ -8,9 +8,7 @@ const logger = require('../lib/logger');
 function normalizeToJid(input) {
   if (!input) return '';
   let s = String(input).trim();
-  // إن كان JID كاملًا (شخص/قروب) نعيده كما هو
   if (/@s\.whatsapp\.net$/.test(s) || /@g\.us$/.test(s)) return s;
-  // أرقام فقط → اعتبره رقم واتساب لشخص
   s = s.replace(/[^\d\-]/g, '');
   if (/^\d{6,20}$/.test(s)) return `${s}@s.whatsapp.net`;
   return '';
@@ -20,7 +18,6 @@ function startTelegram(token, adminId) {
   if (!token || !adminId) return null;
 
   const bot = new TelegramBot(token, { polling: false });
-  // تنظيف أي WebHook قديم ثم ابدأ polling
   bot.deleteWebHook({ drop_pending_updates: true }).catch(() => {});
   bot.startPolling({ restart: true, interval: 300, timeout: 30 }).catch(() => {});
 
@@ -39,24 +36,60 @@ function startTelegram(token, adminId) {
     }
   }
 
+  function helpText() {
+    return [
+      '*أوامر المشرف (تيليجرام)*',
+      '',
+      '• `/help` — عرض هذه القائمة.',
+      '• `/ignore 9677XXXXXXXX` — تجاهل رقم/محادثة (لن يرد عليها البوت).',
+      '• `/allow 9677XXXXXXXX` — إزالة التجاهل.',
+      '• `/ignores` — عرض قائمة التجاهل.',
+      '• `/jidify 9677XXXXXXXX` — تحويل رقم إلى JID شخصي (@s.whatsapp.net).',
+      '',
+      '*إدارة القروبات*',
+      '• `/g_enable 1203...@g.us` — تفعيل إدارة القروب.',
+      '• `/g_disable 1203...@g.us` — تعطيل إدارة القروب.',
+      '• `/g_rules_set 1203...@g.us نص القوانين...` — ضبط القوانين.',
+      '• `/g_rules_get 1203...@g.us` — عرض القوانين.',
+      '• `/g_media on|off 1203...@g.us` — حظر/سماح الوسائط.',
+      '• `/g_links on|off 1203...@g.us` — حظر/سماح الروابط.',
+      '• `/g_banword_add 1203...@g.us كلمة` — إضافة كلمة محظورة.',
+      '• `/g_banword_remove 1203...@g.us كلمة` — إزالة كلمة محظورة.',
+      '• `/g_banword_list 1203...@g.us` — عرض قائمة الكلمات المحظورة.',
+      '• `/g_warns_get 1203...@g.us 9677XXXXXXXX` — عرض تحذيرات عضو.',
+      '• `/g_warns_reset 1203...@g.us 9677XXXXXXXX` — تصفير تحذيرات عضو.',
+      '• `/g_status 1203...@g.us` — ملخّص حالة القروب.',
+      '',
+      '_ملاحظة:_ للحصول على JID لأي قروب/مستخدم من داخل واتساب، أرسل أمر *المعرف* أو *id* هناك، وسيُرجع لك الـ JID بدقة.'
+    ].join('\n');
+  }
+
   bot.on('text', async (msg) => {
-    if (String(msg.chat.id) !== String(adminId)) return; // أوامر للمشرف فقط
+    if (String(msg.chat.id) !== String(adminId)) return;
     const text = (msg.text || '').trim();
     const [rawCmd, ...rest] = text.split(/\s+/);
     const cmd  = (rawCmd || '').toLowerCase();
     const args = rest;
 
     try {
+      // ======== قائمة الأوامر ========
+      if (cmd === '/help' || cmd === '/commands') {
+        return bot.sendMessage(adminId, helpText(), { parse_mode: 'Markdown' });
+      }
+
+      // ======== أدوات JID بسيطة ========
+      if (cmd === '/jidify') {
+        const input = args.join(' ').trim();
+        const jid = normalizeToJid(input);
+        if (!jid) return bot.sendMessage(adminId, 'استخدم: `/jidify 9677XXXXXXXX`', { parse_mode: 'Markdown' });
+        return bot.sendMessage(adminId, '`' + jid + '`', { parse_mode: 'Markdown' });
+      }
+
       // ======== أوامر التجاهل العام ========
       if (cmd === '/ignore') {
-        const argRaw = args.join(' ').trim();
-        const jid = normalizeToJid(argRaw);
+        const jid = normalizeToJid(args.join(' ').trim());
         if (!jid) {
-          return bot.sendMessage(
-            adminId,
-            '⚠️ رجاءً أرسل رقمًا صحيحًا أو JID كامل.\nمثال: `/ignore 9677XXXXXXXX`',
-            { parse_mode: 'Markdown' }
-          );
+          return bot.sendMessage(adminId, '⚠️ رجاءً أرسل رقمًا صحيحًا أو JID كامل.\nمثال: `/ignore 9677XXXXXXXX`', { parse_mode: 'Markdown' });
         }
         const bare = jid.replace(/@.+$/, '');
         await IgnoreChat.findOneAndUpdate(
@@ -68,14 +101,9 @@ function startTelegram(token, adminId) {
       }
 
       if (cmd === '/allow' || cmd === '/unignore') {
-        const argRaw = args.join(' ').trim();
-        const jid = normalizeToJid(argRaw);
+        const jid = normalizeToJid(args.join(' ').trim());
         if (!jid) {
-          return bot.sendMessage(
-            adminId,
-            '⚠️ رجاءً أرسل رقمًا صحيحًا أو JID كامل.\nمثال: `/allow 9677XXXXXXXX`',
-            { parse_mode: 'Markdown' }
-          );
+          return bot.sendMessage(adminId, '⚠️ رجاءً رجاءً أرسل رقمًا صحيحًا أو JID كامل.\nمثال: `/allow 9677XXXXXXXX`', { parse_mode: 'Markdown' });
         }
         const bare = jid.replace(/@.+$/, '');
         const res = await IgnoreChat.deleteMany({ $or: [{ chatId: jid }, { chatId: bare }, { bare }] });
