@@ -8,27 +8,24 @@ try { contains = require('../../config/contains.json'); } catch (_) { contains =
 try { intents  = require('../../config/intents.json');   } catch (_) { intents  = {}; }
 const logger = require('../../lib/logger');
 
-// تحميل الأوامر مرة واحدة
 let registry = null;
 function ensureRegistry() {
   if (!registry) registry = loadCommands(path.join(__dirname, '../../commands'));
   return registry;
 }
 
-// تطبيع عربي: إزالة التشكيل/التطويل وتوحيد الحروف + إزالة الرموز/الإيموجي
 function normalizeArabic(input) {
   let s = String(input || '').trim();
-  s = s.replace(/[\u064B-\u065F\u0610-\u061A\u06D6-\u06ED]/g, ''); // التشكيل
-  s = s.replace(/\u0640/g, '');                                     // التطويل
-  s = s.replace(/[إأآا]/g, 'ا');                                    // الألف
-  s = s.replace(/[يى]/g, 'ي');                                      // الياء/المقصورة
-  s = s.replace(/ة/g, 'ه');                                         // التاء المربوطة
-  s = s.replace(/[^\p{L}\p{N}\s]/gu, ' ');                          // رموز/إيموجي
+  s = s.replace(/[\u064B-\u065F\u0610-\u061A\u06D6-\u06ED]/g, '');
+  s = s.replace(/\u0640/g, '');
+  s = s.replace(/[إأآا]/g, 'ا');
+  s = s.replace(/[يى]/g, 'ي');
+  s = s.replace(/ة/g, 'ه');
+  s = s.replace(/[^\p{L}\p{N}\s]/gu, ' ');
   s = s.replace(/\s+/g, ' ').trim();
   return s;
 }
 
-// قاموس مطابق تمامًا (بعد التطبيع) مع كاش
 function matchExactKeyword(textNorm) {
   if (!matchExactKeyword._cache) {
     const c = {};
@@ -38,10 +35,8 @@ function matchExactKeyword(textNorm) {
   return matchExactKeyword._cache[textNorm] || '';
 }
 
-// قاموس contains ذكي (قبل intents): يبحث عن أي من العبارات ويعيد ردًا ملائمًا
-function pick(arr) { return Array.isArray(arr) && arr.length ? arr[Math.floor(Math.random()*arr.length)] : ''; }
-function matchContains(textNorm) {
-  // contains.json: { key: { any: [..], replies: [..] }, ... }
+function pick(arr){ return Array.isArray(arr)&&arr.length? arr[Math.floor(Math.random()*arr.length)] : ''; }
+function matchContains(textNorm){
   for (const key of Object.keys(contains)) {
     const rule = contains[key];
     if (!rule || !Array.isArray(rule.any) || !Array.isArray(rule.replies)) continue;
@@ -51,8 +46,7 @@ function matchContains(textNorm) {
   return '';
 }
 
-// نوايا عامة كملاذ أخير
-function matchIntent(textNorm) {
+function matchIntent(textNorm){
   for (const key of Object.keys(intents)) {
     const rule = intents[key];
     if (!rule || !Array.isArray(rule.any) || !rule.reply) continue;
@@ -62,19 +56,15 @@ function matchIntent(textNorm) {
   return '';
 }
 
-// إيجاد الأمر بدون بادئة: أول كلمة = اسم/مرادف
 function resolveCommandName(firstToken, reg) {
   if (!firstToken) return '';
   const t  = firstToken;
   const tl = String(firstToken).toLowerCase();
-
   if (reg.commands.has(t)) return t;
   if (reg.aliases.has(t))  return reg.aliases.get(t);
-
   for (const name of reg.commands.keys()) if (String(name).toLowerCase() === tl) return name;
   for (const [alias, name] of reg.aliases.entries())
     if (String(alias).toLowerCase() === tl && reg.commands.has(name)) return name;
-
   return '';
 }
 
@@ -88,17 +78,16 @@ function onMessageUpsert(sock) {
         const chatId = m.key?.remoteJid;
         if (!chatId) continue;
 
-        // حراس
         if (m.key?.fromMe) continue;
         if (chatId === 'status@broadcast') continue;
         const sender = m.key?.participant || '';
         if (selfBare && String(sender).startsWith(selfBare)) continue;
 
-        // قائمة التجاهل
-        const ignored = await IgnoreChat.findOne({ chatId }).lean().catch(() => null);
+        // ⬇️ التعديل هنا: افحص JID الكامل والرقم المجرّد (bare)
+        const bare = chatId.replace(/@.+$/, '');
+        const ignored = await IgnoreChat.findOne({ $or: [{ chatId }, { chatId: bare }, { bare }] }).lean().catch(() => null);
         if (ignored) continue;
 
-        // نص الرسالة (يشمل كابشن الصورة/الفيديو)
         const rawText =
           (m.message?.conversation ||
            m.message?.extendedTextMessage?.text ||
@@ -111,7 +100,6 @@ function onMessageUpsert(sock) {
         const firstToken = textNorm.split(' ')[0] || '';
         let handled = false;
 
-        // 1) أوامر بدون بادئة
         const cmdName = resolveCommandName(firstToken, reg);
         if (cmdName) {
           const args = rawText.split(/\s+/).slice(1);
@@ -120,41 +108,27 @@ function onMessageUpsert(sock) {
           handled = true;
         }
 
-        // 2) "مساعدة"/help ككلمة كاملة
         if (!handled && (textNorm === 'مساعده' || textNorm === 'help')) {
           const help = require('../../commands/help.js');
           await help.run({ sock, msg: m, args: [] });
           handled = true;
         }
 
-        // 3) قاموس مطابق تمامًا (يحافظ على ردودك التفصيلية)
         if (!handled) {
-          const replyExact = matchExactKeyword(textNorm);
-          if (replyExact) {
-            await sock.sendMessage(chatId, { text: replyExact }, { quoted: m });
-            handled = true;
-          }
+          const r1 = matchExactKeyword(textNorm);
+          if (r1) { await sock.sendMessage(chatId, { text: r1 }, { quoted: m }); handled = true; }
         }
 
-        // 4) قاموس contains الذكي — يعطي ردود مختلفة للتحيات/الجمل الطويلة
         if (!handled) {
-          const replyContains = matchContains(textNorm);
-          if (replyContains) {
-            await sock.sendMessage(chatId, { text: replyContains }, { quoted: m });
-            handled = true;
-          }
+          const r2 = matchContains(textNorm);
+          if (r2) { await sock.sendMessage(chatId, { text: r2 }, { quoted: m }); handled = true; }
         }
 
-        // 5) intents العامة كملاذ أخير فقط
         if (!handled) {
-          const intentReply = matchIntent(textNorm);
-          if (intentReply) {
-            await sock.sendMessage(chatId, { text: intentReply }, { quoted: m });
-            handled = true;
-          }
+          const r3 = matchIntent(textNorm);
+          if (r3) { await sock.sendMessage(chatId, { text: r3 }, { quoted: m }); handled = true; }
         }
 
-        // لا رد افتراضي
       } catch (err) {
         logger.error({ err, stack: err?.stack }, 'message handler error');
       }
