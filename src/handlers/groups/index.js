@@ -1,49 +1,32 @@
-// src/handlers/groups/index.js
 const GroupSettings = require('../../models/GroupSettings');
 const { normalizeUserJid } = require('../../lib/jid');
 const logger = require('../../lib/logger');
 
-/** محاولة ذكية لجلب اسم العرض للعضو */
-async function getDisplayName(sock, userJid) {
+async function getDisplayName(sock, jid) {
   try {
-    // بعض نسخ Baileys توفر getName
-    if (typeof sock.getName === 'function') {
-      const n = sock.getName(userJid);
-      if (n) return n;
-    }
+    const [c] = await sock.onWhatsApp(jid);
+    if (c?.notify) return c.notify;
+    if (c?.verifiedName) return c.verifiedName;
+    if (c?.pushName) return c.pushName;
   } catch {}
-  // احتياط: استخدم الرقم
-  return '+' + userJid.split('@')[0];
+  return '+' + jid.split('@')[0];
 }
 
 async function getGroupSubject(sock, groupId) {
   try {
-    const md = await sock.groupMetadata(groupId);
+    const md = await sock.groupMetadataMinimal(groupId);
     return md?.subject || 'المجموعة';
   } catch {
     return 'المجموعة';
   }
 }
 
-function formatWelcome(name, subject, rules) {
-  const lines = [
-    `🎉 أهلاً وسهلاً *${name}*!`,
-    `مرحبًا بك في *${subject}*.`,
-  ];
-  if (rules && rules.trim()) {
-    lines.push('', '📜 *قوانين المجموعة*:', rules.trim().slice(0, 600));
-  } else {
-    lines.push('', '📜 *قوانين عامة*: الرجاء الالتزام بالأدب العام وعدم إرسال الروابط أو الوسائط المخالفة.');
-  }
-  lines.push('', 'نتمنى لك وقتًا ممتعًا!');
-  return lines.join('\n');
+function welcomeMsg(name, subject, rules) {
+  return `🎉 أهلاً وسهلاً *${name}*!\nمرحبًا بك في *${subject}*.\n\n📜 ${rules || 'الرجاء الالتزام بالقوانين العامة وعدم إرسال روابط أو وسائط مخالفة.'}\n\nنتمنى لك وقتًا ممتعًا!`;
 }
 
-function formatFarewell(name, subject) {
-  return [
-    `👋 وداعًا *${name}*.`,
-    `سعدنا بوجودك معنا في *${subject}*. نتمنى لك التوفيق دائمًا.`,
-  ].join('\n');
+function farewellMsg(name, subject) {
+  return `👋 وداعًا *${name}*.\nسعدنا بوجودك معنا في *${subject}*.`;
 }
 
 function registerGroupParticipantHandler(sock) {
@@ -51,7 +34,7 @@ function registerGroupParticipantHandler(sock) {
     try {
       const groupId = ev.id;
       const settings = await GroupSettings.findOne({ groupId }).lean().catch(() => null);
-      if (!settings || !settings.enabled) return;
+      if (!settings?.enabled) return;
 
       const subject = await getGroupSubject(sock, groupId);
 
@@ -59,8 +42,7 @@ function registerGroupParticipantHandler(sock) {
         for (const p of ev.participants || []) {
           const user = normalizeUserJid(p);
           const name = await getDisplayName(sock, user);
-          const text = formatWelcome(name, subject, settings.rules);
-          await sock.sendMessage(groupId, { text, mentions: [user] });
+          await sock.sendMessage(groupId, { text: welcomeMsg(name, subject, settings.rules), mentions: [user] });
         }
       }
 
@@ -68,8 +50,7 @@ function registerGroupParticipantHandler(sock) {
         for (const p of ev.participants || []) {
           const user = normalizeUserJid(p);
           const name = await getDisplayName(sock, user);
-          const text = formatFarewell(name, subject);
-          await sock.sendMessage(groupId, { text });
+          await sock.sendMessage(groupId, { text: farewellMsg(name, subject) });
         }
       }
     } catch (e) {
