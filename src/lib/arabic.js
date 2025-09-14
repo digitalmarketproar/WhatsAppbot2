@@ -1,32 +1,39 @@
-// تطبيع عربي خفيف + أدوات مساعدة
+// src/lib/arabic.js
 function normalizeArabic(input) {
   let s = String(input || '').trim();
-  s = s.replace(/[\u064B-\u065F\u0610-\u061A\u06D6-\u06ED]/g, ''); // التشكيل
-  s = s.replace(/\u0640/g, '');                                     // التطويل
-  s = s.replace(/[إأآا]/g, 'ا');                                    // الألف
-  s = s.replace(/[يى]/g, 'ي');                                      // الياء/المقصورة
-  s = s.replace(/ة/g, 'ه');                                         // التاء المربوطة
-  s = s.replace(/[^\p{L}\p{N}\s]/gu, ' ');                          // رموز/إيموجي
+  // إزالة التشكيل
+  s = s.replace(/[\u064B-\u065F\u0610-\u061A\u06D6-\u06ED]/g, '');
+  // إزالة التطويل
+  s = s.replace(/\u0640/g, '');
+  // توحيد الألف
+  s = s.replace(/[إأآا]/g, 'ا');
+  // توحيد الياء/الألف المقصورة
+  s = s.replace(/[يى]/g, 'ي');
+  // توحيد التاء المربوطة
+  s = s.replace(/ة/g, 'ه');
+  // مسافات زائدة
   s = s.replace(/\s+/g, ' ').trim();
   return s;
 }
 
-const linkRegex = /\b((?:https?:\/\/|www\.)[^\s]+|(?:t\.me|wa\.me|chat\.whatsapp\.com)\/[^\s]+)/i;
-
+// كشف روابط (http/https + دعوات واتساب)
+const LINK_REGEX = /\b((https?:\/\/|www\.)[^\s]+|chat\.whatsapp\.com\/[A-Za-z0-9]+|wa\.me\/\d+)\b/i;
 function hasLink(text) {
-  return linkRegex.test(text || '');
+  return LINK_REGEX.test(String(text || ''));
 }
 
-function isMediaMessage(msg) {
-  const m = msg?.message || {};
+function isMediaMessage(m) {
+  const msg = m?.message || {};
   return !!(
-    m.imageMessage ||
-    m.videoMessage ||
-    m.audioMessage ||
-    m.stickerMessage ||
-    m.documentMessage ||
-    m.contactsArrayMessage ||
-    m.pollCreationMessage
+    msg.imageMessage ||
+    msg.videoMessage ||
+    msg.audioMessage ||
+    msg.documentMessage ||
+    msg.stickerMessage ||
+    msg.locationMessage ||
+    msg.liveLocationMessage ||
+    msg.contactMessage ||
+    msg.contactsArrayMessage
   );
 }
 
