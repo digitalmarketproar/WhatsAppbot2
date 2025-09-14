@@ -1,12 +1,13 @@
+// src/app/whatsapp.js
 const { default: makeWASocket, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const logger = require('../lib/logger');
 const { mongoAuthState } = require('../lib/wa-mongo-auth');
+const { registerSelfHeal } = require('../lib/selfheal');
 
 async function createWhatsApp({ telegram } = {}) {
   const { state, saveCreds } = await mongoAuthState(logger);
   const { version } = await fetchLatestBaileysVersion();
 
-  // عدّادات إعادة المحاولة للرسائل (مهم لتفادي تكرار غير منضبط)
   const msgRetryCounterMap = {};
 
   const sock = makeWASocket({
@@ -16,7 +17,7 @@ async function createWhatsApp({ telegram } = {}) {
     logger,
     emitOwnEvents: false,
     syncFullHistory: false,
-    shouldSyncHistoryMessage: () => false, // لازم تكون دالة
+    shouldSyncHistoryMessage: () => false,
     markOnlineOnConnect: false,
     getMessage: async () => undefined,
     msgRetryCounterMap
@@ -33,15 +34,8 @@ async function createWhatsApp({ telegram } = {}) {
     }
   });
 
-  // لوج أخطاء فك التعمية (تشخيص فقط)
-  sock.ev.on('messages.update', (updates) => {
-    for (const u of updates) {
-      if (u.update && u.update.status && u.update.status === 8) {
-        // 8 = message decryption failure in بعض إصدارات Baileys
-        logger.warn({ key: u.key }, 'decrypt fail (status=8)');
-      }
-    }
-  });
+  // تعافٍ تلقائي من أعطال التشفير
+  registerSelfHeal(sock);
 
   return sock;
 }
