@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: whatsapp-bot
+    env: node
+    plan: free          # أو basic/pro حسب ما تختار
+    buildCommand: "npm install"
+    startCommand: "node index.js"
+    envVars:
+      - key: PORT
+        value: 3000
+      - key: LOG_LEVEL
+        value: info
+      - key: MONGODB_URI
+        sync: false       # تضعها من Dashboard كـ Secret
+      - key: TELEGRAM_TOKEN
+        sync: false       # تضعها من Dashboard كـ Secret
+      - key: TELEGRAM_ADMIN_ID
+        sync: false       # تضعها من Dashboard كـ Secret
