@@ -11,9 +11,10 @@ async function createWhatsApp({ telegram } = {}) {
     auth: state,
     printQRInTerminal: !telegram,
     logger,
+    // ↓↓↓ هذه الأعلام آمنة، والمهم هنا تحويل shouldSyncHistoryMessage إلى "دالة"
     emitOwnEvents: false,
     syncFullHistory: false,
-    shouldSyncHistoryMessage: false,
+    shouldSyncHistoryMessage: () => false, // ← كان false مسبقًا (سبب الخطأ)
     markOnlineOnConnect: false,
     getMessage: async () => undefined
   });
