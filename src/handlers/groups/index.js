@@ -1,7 +1,12 @@
+// src/handlers/groups/index.js
 const GroupSettings = require('../../models/GroupSettings');
-const { normalizeUserJid } = require('../../lib/jid');
 const logger = require('../../lib/logger');
 
+/**
+ * نجلب اسم العرض للعضو قدر الإمكان.
+ * نحاول onWhatsApp() لاسترجاع notify/verifiedName/pushName،
+ * وإن لم يتوفر نرجع الرقم مع "+" كحل أخير.
+ */
 async function getDisplayName(sock, jid) {
   try {
     const [c] = await sock.onWhatsApp(jid);
@@ -9,11 +14,13 @@ async function getDisplayName(sock, jid) {
     if (c?.verifiedName) return c.verifiedName;
     if (c?.pushName) return c.pushName;
   } catch {}
-  return '+' + jid.split('@')[0];
+  return '+' + String(jid).split('@')[0];
 }
 
+/** نجلب اسم القروب مع استهلاك خفيف */
 async function getGroupSubject(sock, groupId) {
   try {
+    // minimal أخف من groupMetadata الكامل
     const md = await sock.groupMetadataMinimal(groupId);
     return md?.subject || 'المجموعة';
   } catch {
@@ -22,11 +29,23 @@ async function getGroupSubject(sock, groupId) {
 }
 
 function welcomeMsg(name, subject, rules) {
-  return `🎉 أهلاً وسهلاً *${name}*!\nمرحبًا بك في *${subject}*.\n\n📜 ${rules || 'الرجاء الالتزام بالقوانين العامة وعدم إرسال روابط أو وسائط مخالفة.'}\n\nنتمنى لك وقتًا ممتعًا!`;
+  return [
+    `🎉 أهلاً وسهلاً *${name}*!`,
+    `مرحبًا بك في *${subject}*.`,
+    '',
+    '📜 ' + (rules && rules.trim()
+      ? `*قوانين المجموعة*: \n${rules.trim().slice(0, 600)}`
+      : '*قوانين عامة*: الرجاء الالتزام بالأدب العام وعدم إرسال الروابط أو الوسائط المخالفة.'),
+    '',
+    'نتمنى لك وقتًا ممتعًا!'
+  ].join('\n');
 }
 
 function farewellMsg(name, subject) {
-  return `👋 وداعًا *${name}*.\nسعدنا بوجودك معنا في *${subject}*.`;
+  return [
+    `👋 وداعًا *${name}*.`,
+    `سعدنا بوجودك معنا في *${subject}*. نتمنى لك التوفيق دائمًا.`
+  ].join('\n');
 }
 
 function registerGroupParticipantHandler(sock) {
@@ -38,22 +57,22 @@ function registerGroupParticipantHandler(sock) {
 
       const subject = await getGroupSubject(sock, groupId);
 
+      // نستخدم المنشن دائماً ليظهر الاسم/الرقم بوضوح داخل واتساب
       if (ev.action === 'add' && settings.welcomeEnabled) {
         for (const p of ev.participants || []) {
-          const user = normalizeUserJid(p);
-          const name = await getDisplayName(sock, user);
-          await sock.sendMessage(groupId, { text: welcomeMsg(name, subject, settings.rules), mentions: [user] });
+          const name = await getDisplayName(sock, p);
+          await sock.sendMessage(groupId, { text: welcomeMsg(name, subject, settings.rules), mentions: [p] });
         }
       }
 
       if (ev.action === 'remove' && settings.farewellEnabled) {
         for (const p of ev.participants || []) {
-          const user = normalizeUserJid(p);
-          const name = await getDisplayName(sock, user);
+          const name = await getDisplayName(sock, p);
           await sock.sendMessage(groupId, { text: farewellMsg(name, subject) });
         }
       }
     } catch (e) {
+      // إذا كانت هناك مجموعات لا نملك صلاحية عرض بياناتها، لا نُسقط البوت
       logger.warn({ e, ev }, 'group-participants.update handler failed');
     }
   });
