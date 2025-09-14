@@ -3,6 +3,8 @@ const UserWarning = require('../../models/UserWarning');
 const { normalizeArabic, hasLink, isMediaMessage } = require('../../lib/arabic');
 const logger = require('../../lib/logger');
 
+const notAdminCooldown = new Map(); // groupId -> ts
+
 async function isGroupAdmin(sock, groupId, userJid) {
   try {
     const md = await sock.groupMetadata(groupId);
@@ -67,8 +69,12 @@ async function moderateGroupMessage(sock, m) {
   const meJid = sock.user?.id;
   const amIAdmin = await isGroupAdmin(sock, groupId, meJid);
   if (!amIAdmin) {
-    // ننبه مرة واحدة فقط كل فترة؟ (للتبسيط: نرسل أحيانًا)
-    await sock.sendMessage(groupId, { text: '⚠️ لتفعيل الحذف/الحظر: الرجاء ترقية البوت إلى *مشرف*.' });
+    const last = notAdminCooldown.get(groupId) || 0;
+    const now  = Date.now();
+    if (now - last > 10 * 60 * 1000) { // 10 دقائق
+      await sock.sendMessage(groupId, { text: '⚠️ لتفعيل الحذف/الحظر: الرجاء ترقية البوت إلى *مشرف*.' });
+      notAdminCooldown.set(groupId, now);
+    }
     return false; // لا نحاول حذف بدون صلاحية
   }
 
