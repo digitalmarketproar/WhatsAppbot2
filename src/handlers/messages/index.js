@@ -9,14 +9,14 @@ const logger = require('../../lib/logger');
 const { normalizeArabic } = require('../../lib/arabic');
 const { moderateGroupMessage } = require('./moderation');
 
-// تحميل الأوامر مرة واحدة
+// تحميل الأوامر مرة واحدة (للاستخدام في الخاص فقط)
 let registry = null;
 function ensureRegistry() {
   if (!registry) registry = loadCommands(path.join(__dirname, '../../commands'));
   return registry;
 }
 
-// قاموس مطابق تمامًا مع كاش
+// قاموس مطابق تمامًا مع كاش (لِلخاص فقط)
 function matchExactKeyword(textNorm) {
   if (!matchExactKeyword._cache) {
     const c = {};
@@ -26,7 +26,7 @@ function matchExactKeyword(textNorm) {
   return matchExactKeyword._cache[textNorm] || '';
 }
 
-// contains (قبل intents) — يُختار ردًا من مصفوفة
+// contains (قبل intents) — يُختار ردًا من مصفوفة (لِلخاص فقط)
 function pick(arr) { return Array.isArray(arr)&&arr.length ? arr[Math.floor(Math.random()*arr.length)] : ''; }
 function matchContains(textNorm) {
   for (const key of Object.keys(contains || {})) {
@@ -38,7 +38,7 @@ function matchContains(textNorm) {
   return '';
 }
 
-// intents كملاذ أخير
+// intents كملاذ أخير (لِلخاص فقط)
 function matchIntent(textNorm) {
   for (const key of Object.keys(intents || {})) {
     const rule = intents[key];
@@ -49,7 +49,7 @@ function matchIntent(textNorm) {
   return '';
 }
 
-// استخراج نص الرسالة (للأوامر/القاموس)
+// استخراج نص الرسالة
 function extractText(m) {
   return (
     m.message?.conversation ||
@@ -60,7 +60,7 @@ function extractText(m) {
   ).trim();
 }
 
-// إيجاد الأمر بدون بادئة: أول كلمة = اسم/مرادف
+// إيجاد الأمر بدون بادئة (لِلخاص فقط)
 function resolveCommandName(firstToken, reg) {
   if (!firstToken) return '';
   const t  = firstToken;
@@ -95,17 +95,22 @@ function onMessageUpsert(sock) {
         const ignored = await IgnoreChat.findOne({ $or: [{ chatId }, { chatId: bare }, { bare }] }).lean().catch(() => null);
         if (ignored) continue;
 
-        // 0) إدارة القروبات أولاً (إن كانت الرسالة في قروب مُدار)
-        const moderated = await moderateGroupMessage(sock, m);
-        if (moderated) continue; // تمت المعالجة (حذف/تحذير/طرد)
+        // لو كانت الرسالة داخل قروب: إدارة فقط — بلا أي ردود قاموس/أوامر
+        const isGroup = chatId.endsWith('@g.us');
+        if (isGroup) {
+          await moderateGroupMessage(sock, m); // قد يحذف/يحذر/يطرد عند الحاجة
+          continue;
+        }
 
-        // 1) أوامر بدون بادئة
+        // من هنا فصاعدًا: خاص فقط (الأوامر + القاموس)
         const rawText   = extractText(m);
         if (!rawText) continue;
         const textNorm  = normalizeArabic(rawText);
         const firstWord = textNorm.split(' ')[0] || '';
 
         let handled = false;
+
+        // 1) أوامر بلا بادئة (خاص)
         const cmdName = resolveCommandName(firstWord, reg);
         if (cmdName) {
           const args = rawText.split(/\s+/).slice(1);
@@ -113,7 +118,7 @@ function onMessageUpsert(sock) {
           handled = true;
         }
 
-        // 2) "مساعدة"
+        // 2) "مساعدة"/help
         if (!handled && (textNorm === 'مساعده' || textNorm === 'help')) {
           const help = require('../../commands/help.js');
           await help.run({ sock, msg: m, args: [] });
