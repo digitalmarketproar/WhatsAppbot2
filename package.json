@@ -1,0 +1,22 @@
+{
+  "name": "whatsapp-bot-baileys",
+  "version": "0.3.0",
+  "description": "WhatsApp bot using Baileys, Express, MongoDB auth state, and Telegram QR delivery.",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "NODE_ENV=development node index.js"
+  },
+  "dependencies": {
+    "@hapi/boom": "^10.0.1",
+    "@whiskeysockets/baileys": "^6.7.18",
+    "express": "^4.19.2",
+    "mongoose": "^8.6.0",
+    "node-telegram-bot-api": "^0.66.0",
+    "pino": "^9.0.0",
+    "pino-pretty": "^11.0.0",
+    "qrcode": "^1.5.4",
+    "dotenv": "^16.4.5"
+  }
+}
