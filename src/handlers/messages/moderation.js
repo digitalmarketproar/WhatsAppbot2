@@ -95,11 +95,24 @@ async function resolveParticipantJid(sock, groupId, anyUserJid) {
   return normalizeUserJid(anyUserJid);
 }
 
-/** فحص القائمة البيضاء */
-function inWhitelist(settings, anyUserJid) {
-  const bare = bareNumber(normalizeUserJid(anyUserJid)).replace(/\D/g, '');
-  const list = Array.isArray(settings?.whitelistNumbers) ? settings.whitelistNumbers : [];
-  return list.includes(bare);
+/** حوّل أي قيمة إلى bare number منقّى من أي رموز */
+function toBareNum(v) {
+  if (!v) return '';
+  // يدعم إدخال jid (xxx@domain) أو رقم صِرف أو participantPn
+  const s = String(v);
+  const beforeAt = s.includes('@') ? s.split('@')[0] : s;
+  return beforeAt.replace(/\D/g, '');
+}
+
+/** فحص القائمة البيضاء: يطابق ضد عدة مرشّحين للمرسل للتغلب على فروقات LID/MD */
+function inWhitelist(settings, candidates = []) {
+  const list = Array.isArray(settings?.whitelistNumbers) ? settings.whitelistNumbers.map(toBareNum) : [];
+  if (!list.length) return false;
+  for (const c of candidates) {
+    const b = toBareNum(c);
+    if (b && list.includes(b)) return true;
+  }
+  return false;
 }
 
 /** المعالجة الأساسية للرسائل في القروبات */
@@ -116,13 +129,21 @@ async function moderateGroupMessage(sock, m) {
     return false;
   }
 
-  const fromUserJid = normalizeUserJid(senderRaw);
-  const senderBare  = bareNumber(fromUserJid);
-  const realParticipantJid = await resolveParticipantJid(sock, groupId, fromUserJid);
+  // جهّز كل صيغ الهوية الممكنة للمرسل
+  const fromUserJid       = normalizeUserJid(senderRaw);                 // قد يكون lid ← s.whatsapp
+  const realParticipantJid= await resolveParticipantJid(sock, groupId, fromUserJid); // JID الفعلي في القروب
+  const participantPn     = m?.key?.participantPn || null;               // إن وُجد (من لوجك)
+  const senderBare        = toBareNum(fromUserJid);
 
-  // ✅ استثناء بالقائمة البيضاء فقط (Early Return)
-  if (inWhitelist(settings, realParticipantJid)) {
-    logger.debug?.({ groupId, user: realParticipantJid }, 'skip moderation: whitelist exempt');
+  // ✅ استثناء بالقائمة البيضاء فقط (Early Return) مع تعدد المرشّحين
+  // يشمل: JID الفعلي، JID الخام، participantPn (إن وُجد)
+  const wlHit = inWhitelist(settings, [realParticipantJid, fromUserJid, participantPn]);
+  if (wlHit) {
+    logger.debug?.({
+      groupId, user: realParticipantJid,
+      candidates: { realParticipantJid, fromUserJid, participantPn },
+      whitelist: settings?.whitelistNumbers
+    }, 'skip moderation: whitelist exempt');
     return false;
   }
 
