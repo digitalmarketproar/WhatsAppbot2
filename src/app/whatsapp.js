@@ -21,6 +21,7 @@ async function createWhatsApp({ telegram } = {}) {
     printQRInTerminal: !telegram,
     logger,
     emitOwnEvents: false,
+
     // لا نحتاج مزامنة تاريخ قديم
     syncFullHistory: false,
     shouldSyncHistoryMessage: () => false,
@@ -33,7 +34,11 @@ async function createWhatsApp({ telegram } = {}) {
     },
 
     // مهم جداً: تتبّع محاولات إعادة فك التشفير
-    msgRetryCounterCache
+    msgRetryCounterCache,
+
+    // ⛔ تجاهل الستاتس كليًا داخل Baileys (يمنع فك التشفير/الريتراي من الأساس)
+    // مدعوم في Baileys لإسكات JIDs معينة.
+    shouldIgnoreJid: (jid) => jid === 'status@broadcast',
   });
 
   // احفظ الاعتمادات دائماً
@@ -42,6 +47,11 @@ async function createWhatsApp({ telegram } = {}) {
   // خزّن الرسائل الواردة كي تعمل getMessage في أي إعادة محاولة
   sock.ev.on('messages.upsert', ({ messages }) => {
     for (const m of messages || []) {
+      const rjid = m?.key?.remoteJid;
+      if (rjid === 'status@broadcast') {
+        // لا نخزن ولا نُفعّل أي منطق للستاتس
+        continue;
+      }
       if (m?.key?.id) {
         // يمكنك لاحقًا تطبيق LRU/حد أقصى، لكن هذا يكفي الآن
         messageStore.set(m.key.id, m);
@@ -49,14 +59,21 @@ async function createWhatsApp({ telegram } = {}) {
     }
   });
 
-  // لو حصلت تحديثات تشير لإعادة محاولة/فشل تشفير — اعمل resync خفيفة
+  // لو حصلت تحديثات تشير لإعادة محاولة/فشل تشفير — اعمل resync خفيفة (عدا الستاتس)
   sock.ev.on('messages.update', async (updates) => {
     for (const u of updates || []) {
       try {
+        const rjid = u?.key?.remoteJid;
+        if (rjid === 'status@broadcast') {
+          // لا ترسل retry receipts ولا تعمل resync بسبب الستاتس
+          continue;
+        }
+
         const needsResync =
           u.update?.retry ||
           u.update?.status === 409 ||
           u.update?.status === 410;
+
         if (needsResync) {
           try {
             await sock.resyncAppState?.(['critical_unblock_low']);
