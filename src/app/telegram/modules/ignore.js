@@ -11,7 +11,7 @@ module.exports = function registerIgnoreCommands(ctx) {
       if (!jid) return ctx.bot.sendMessage(ctx.adminId, 'استخدم: /ignore 9677XXXXXXXX');
       const bare = jid.replace(/@.+$/, '');
       await IgnoreChat.findOneAndUpdate(
-        { $or: [{ chatId: jid }, { chatId: bare }, { bare }] },
+        { $or: [{ chatId: jid }, { chatId: bare }, { bare: bare }] },
         { chatId: jid, bare, addedBy: 'admin' },
         { upsert: true, new: true }
       );
@@ -22,7 +22,7 @@ module.exports = function registerIgnoreCommands(ctx) {
       const jid = normalizeToJid(parts.join(' ').trim());
       if (!jid) return ctx.bot.sendMessage(ctx.adminId, 'استخدم: /allow 9677XXXXXXXX');
       const bare = jid.replace(/@.+$/, '');
-      const res = await IgnoreChat.deleteMany({ $or: [{ chatId: jid }, { chatId: bare }, { bare }] });
+      const res = await IgnoreChat.deleteMany({ $or: [{ chatId: jid }, { chatId: bare }, { bare: bare }] });
       return ctx.bot.sendMessage(ctx.adminId, `✅ تمت الإزالة من التجاهل: ${jid} (حُذف ${res.deletedCount})`);
     }
 
