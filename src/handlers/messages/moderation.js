@@ -5,13 +5,9 @@
 // - حذف رسالة المخالفة أولًا لتخفيف التشويش.
 // - تحذير 1..N ثم حظر في التحذير N (افتراضيًا 3).
 // - منشن صحيح عبر تمرير mentions + كتابة @الرقم في النص.
-// - عرض الاسم إن توفر وإلا نعرض الرقم.
+// - عرض الاسم إن توفر وإلا نعرض @الرقم.
 // - استثناء المشرفين (مفعّل افتراضيًا عبر GroupSettings.exemptAdmins).
 // - التعامل مع JID بنمط @lid أو @s.whatsapp.net بشكل صحيح.
-//
-// ملاحظات:
-// - يعتمد على: GroupSettings, UserWarning, logger, arabic.js, jid.js
-// - مكتبة Baileys: sock.sendMessage / groupMetadata / groupParticipantsUpdate.
 
 const GroupSettings = require('../../models/GroupSettings');
 const UserWarning   = require('../../models/UserWarning');
@@ -33,6 +29,29 @@ async function safeSend(sock, jid, content, extra = {}) {
   }
 }
 
+/** استخراج الرقم من JID */
+function numberFromJid(jid = '') {
+  const beforeAt = String(jid).split('@')[0] || '';
+  return beforeAt.split(':')[0];
+}
+
+/** جلب اسم العرض بسرعة من الكاش وإلا @الرقم */
+function getDisplayNameFast(sock, jid) {
+  try {
+    const c = sock?.contacts?.[jid] || null;
+    const name =
+      c?.name ||
+      c?.verifiedName ||
+      c?.notify ||
+      null;
+    return name && String(name).trim()
+      ? name.trim()
+      : `@${numberFromJid(jid)}`;
+  } catch {
+    return `@${numberFromJid(jid)}`;
+  }
+}
+
 /** استخراج نص الرسالة الخام */
 function textFromMessage(m = {}) {
   const msg = m.message || {};
@@ -41,7 +60,6 @@ function textFromMessage(m = {}) {
   if (msg.imageMessage && msg.imageMessage.caption) return msg.imageMessage.caption;
   if (msg.videoMessage && msg.videoMessage.caption) return msg.videoMessage.caption;
   if (msg.documentMessage && msg.documentMessage.caption) return msg.documentMessage.caption;
-  // جرّب أي حقل نصي معروف آخر
   for (const k of Object.keys(msg)) {
     const v = msg[k];
     if (v && typeof v.text === 'string') return v.text;
@@ -58,7 +76,7 @@ async function deleteOffendingMessage(sock, m) {
         remoteJid: groupId,
         fromMe: false,
         id: m.key.id,
-        participant: m.key.participant || m.participant, // قد يكون @lid
+        participant: m.key.participant || m.participant,
       },
     });
     return true;
@@ -66,7 +84,6 @@ async function deleteOffendingMessage(sock, m) {
     const code = e?.data || e?.output?.statusCode;
     const msg  = String(e?.message || '').toLowerCase();
     if (code === 403 || msg.includes('forbidden') || msg.includes('not admin')) {
-      // ليس مشرفًا — لا تكرر التنبيه كثيرًا
       const last = remind403.get(groupId) || 0;
       const now  = Date.now();
       if (now - last > 10 * 60 * 1000) {
@@ -80,7 +97,7 @@ async function deleteOffendingMessage(sock, m) {
   }
 }
 
-/** كاش المشرفين كأرقام عارية لسرعة التحقق من الإعفاء */
+/** كاش المشرفين */
 async function getAdminsNumbersCached(sock, groupId) {
   const now = Date.now();
   const cached = adminsCache.get(groupId);
@@ -89,7 +106,7 @@ async function getAdminsNumbersCached(sock, groupId) {
   const extract = (participants = []) =>
     new Set(
       participants
-        .filter(p => p?.admin) // Baileys يضع admin=true للمشرفين
+        .filter(p => p?.admin)
         .map(p => bareNumber(normalizeUserJid(p.id)))
     );
 
@@ -108,31 +125,7 @@ async function getAdminsNumbersCached(sock, groupId) {
   return new Set();
 }
 
-/** جلب اسم العرض من القروب، ثم getName، ثم رجوع لرقم +XXXXXXXX */
-async function getDisplayNameInGroup(sock, groupId, anyUserJid) {
-  const targetBare = bareNumber(normalizeUserJid(anyUserJid));
-  try {
-    const mdMin = await sock.groupMetadataMinimal(groupId);
-    const p = (mdMin?.participants || []).find((x) => bareNumber(normalizeUserJid(x.id)) === targetBare);
-    const name = p?.notify || p?.name || p?.verifiedName;
-    if (name && String(name).trim()) return String(name).trim();
-  } catch {}
-  try {
-    const md = await sock.groupMetadata(groupId);
-    const p = (md?.participants || []).find((x) => bareNumber(normalizeUserJid(x.id)) === targetBare);
-    const name = p?.notify || p?.name || p?.verifiedName;
-    if (name && String(name).trim()) return String(name).trim();
-  } catch {}
-  try {
-    if (typeof sock.getName === 'function') {
-      const n = sock.getName(normalizeUserJid(anyUserJid));
-      if (n && String(n).trim()) return String(n).trim();
-    }
-  } catch {}
-  return '+' + targetBare;
-}
-
-/** إيجاد معرف العضو الحقيقي كما يراه واتساب في القروب (قد يكون @lid) */
+/** إيجاد JID العضو الحقيقي كما يراه واتساب */
 async function resolveParticipantJid(sock, groupId, anyUserJid) {
   const targetBare = bareNumber(normalizeUserJid(anyUserJid));
   try {
@@ -148,14 +141,7 @@ async function resolveParticipantJid(sock, groupId, anyUserJid) {
   return normalizeUserJid(anyUserJid);
 }
 
-/** يبني نص منشن لا يكرر المعرف: إن كان الاسم رقمًا، فقط @الرقم؛ غير ذلك @الرقم — *الاسم* */
-function buildMentionLine(displayName, bareNum) {
-  const looksNumeric = /^\+?\d[\d\s]*$/.test(displayName || '');
-  if (looksNumeric) return `@${bareNum}`;
-  return `@${bareNum} — *${displayName}*`;
-}
-
-/** المعالجة الأساسية للرسائل في القروبات */
+/** المعالجة الأساسية */
 async function moderateGroupMessage(sock, m) {
   const groupId = m?.key?.remoteJid;
   if (!groupId?.endsWith('@g.us')) return false;
@@ -164,14 +150,11 @@ async function moderateGroupMessage(sock, m) {
   if (!settings?.enabled) return false;
 
   const maxWarnings  = Math.max(1, Number(settings.maxWarnings || 3));
-  // ✅ افتراضيًا: إعفاء المشرفين (إلا إذا ضُبط صراحةً على false في DB)
   const exemptAdmins = settings?.exemptAdmins !== false;
 
-  // المرسل (نحوّل إلى @s.whatsapp.net للحفظ والثبات)
   const fromUserJid = normalizeUserJid(m.key?.participant || m.participant || m.key?.remoteJid || '');
   if (!fromUserJid) return false;
 
-  // إعفاء المشرفين إن كان مفعّلًا
   if (exemptAdmins) {
     const adminsNumbers = await getAdminsNumbersCached(sock, groupId);
     if (adminsNumbers.has(bareNumber(fromUserJid))) {
@@ -180,7 +163,6 @@ async function moderateGroupMessage(sock, m) {
     }
   }
 
-  // كشف المخالفة
   const raw  = textFromMessage(m);
   const norm = normalizeArabic(raw);
 
@@ -193,7 +175,6 @@ async function moderateGroupMessage(sock, m) {
   }
   if (!violated) return false;
 
-  // عدّاد التحذيرات
   let newCount = 1;
   try {
     const doc = await UserWarning.findOneAndUpdate(
@@ -207,21 +188,17 @@ async function moderateGroupMessage(sock, m) {
     logger.warn({ e, groupId, user: fromUserJid }, 'warn counter inc failed');
   }
 
-  const bare = bareNumber(fromUserJid);
-  const displayName = await getDisplayNameInGroup(sock, groupId, fromUserJid);
-  const mentionLine = buildMentionLine(displayName, bare);
-  const mentionsArr = [normalizeUserJid(fromUserJid)]; // لإجبار التلوين الصحيح
+  const nameOrMention = getDisplayNameFast(sock, fromUserJid);
+  const mentionsArr = [normalizeUserJid(fromUserJid)];
 
-  // احذف المخالفة أولًا
   await deleteOffendingMessage(sock, m);
 
   if (newCount >= maxWarnings) {
-    // حظر
     try {
       const participantJid = await resolveParticipantJid(sock, groupId, fromUserJid);
       await sock.groupParticipantsUpdate(groupId, [participantJid], 'remove');
       await UserWarning.deleteOne({ groupId, userId: fromUserJid }).catch(() => {});
-      await safeSend(sock, groupId, { text: `🚫 تم حظر ${mentionLine} بعد ${maxWarnings} مخالفات.`, mentions: mentionsArr }, { quoted: m });
+      await safeSend(sock, groupId, { text: `🚫 تم حظر ${nameOrMention} بعد ${maxWarnings} مخالفات.`, mentions: mentionsArr }, { quoted: m });
       logger.info({ groupId, user: fromUserJid, participantJid }, 'kick success');
     } catch (e) {
       logger.warn({ e, groupId, user: fromUserJid }, 'kick user failed');
@@ -233,8 +210,7 @@ async function moderateGroupMessage(sock, m) {
       }
     }
   } else {
-    // تحذير
-    await safeSend(sock, groupId, { text: `⚠️ المخالفة ${newCount}/${maxWarnings}: ${mentionLine}، الرجاء الالتزام بالقوانين.`, mentions: mentionsArr }, { quoted: m });
+    await safeSend(sock, groupId, { text: `⚠️ المخالفة ${newCount}/${maxWarnings}: ${nameOrMention}، الرجاء الالتزام بالقوانين.`, mentions: mentionsArr }, { quoted: m });
     logger.info({ groupId, user: fromUserJid, count: newCount }, 'warning message sent');
   }
 
