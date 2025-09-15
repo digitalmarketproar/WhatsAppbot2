@@ -1,5 +1,5 @@
 // src/handlers/messages/moderation.js
-// موديريشن القروبات مع استثناء حقيقي للمشرفين ومنشن مضبوط (اسم/رقم)
+// موديريشن القروبات مع استثناء دقيق للمشرفين ومنشن مضبوط.
 // يعتمد على: GroupSettings, UserWarning, logger, arabic.js, jid.js
 
 const GroupSettings = require('../../models/GroupSettings');
@@ -73,7 +73,7 @@ function numberFromJid(jid = '') {
   return beforeAt.split(':')[0];
 }
 
-/** جلب اسم سريع من كاش الاتصالات؛ وإلا نعيد null (نترك المنشن يتكفّل بالرقم) */
+/** جلب اسم سريع من كاش الاتصالات؛ وإلا نعيد null (المنشن يتكفّل بالرقم) */
 function getDisplayNameFast(sock, jid) {
   try {
     const c = sock?.contacts?.[jid] || null;
@@ -86,12 +86,50 @@ function getDisplayNameFast(sock, jid) {
 
 /** إبني سطر منشن مضبوط: دائمًا @الرقم، وإن وُجد اسم بشري أضِفه */
 function buildMentionLine(displayName, bareNum) {
-  // bareNum يجب أن يكون أرقام فقط (بدون مسافات أو رموز)
   const clean = String(bareNum).replace(/\D/g, '');
-  // إن كان displayName مجرد رقم/أرقام، لا نكرّر الاسم
   const looksNumeric = /^\+?\d[\d\s]*$/.test(displayName || '');
   if (!displayName || looksNumeric) return `@${clean}`;
   return `@${clean} — *${displayName}*`;
+}
+
+/** هل المشارك مشرف؟ (تطبيع تعدد الأشكال) */
+function participantIsAdmin(p) {
+  // بعض الإصدارات: p.admin = 'admin' | 'superadmin' | undefined
+  // أخرى: p.admin = true/false أو p.isAdmin = true/false
+  if (!p) return false;
+  if (p.isAdmin === true) return true;
+  if (typeof p.admin === 'boolean') return p.admin;
+  if (typeof p.admin === 'string') {
+    const v = p.admin.toLowerCase();
+    return v === 'admin' || v === 'superadmin';
+  }
+  return false;
+}
+
+/** اجمع Set أرقام المشرفين (صارم) */
+async function fetchAdminsSetStrict(sock, groupId) {
+  const collect = (participants = []) => new Set(
+    (participants || [])
+      .filter(participantIsAdmin)
+      .map(p => bareNumber(normalizeUserJid(p.id)))
+  );
+
+  try {
+    const mdMin = await sock.groupMetadataMinimal(groupId);
+    const set1 = collect(mdMin?.participants);
+    if (set1.size) return set1;
+  } catch (e) {
+    logger.debug?.({ e }, 'groupMetadataMinimal failed (admins)');
+  }
+
+  try {
+    const md = await sock.groupMetadata(groupId);
+    const set2 = collect(md?.participants);
+    return set2;
+  } catch (e) {
+    logger.debug?.({ e }, 'groupMetadata failed (admins)');
+    return new Set();
+  }
 }
 
 /** كاش المشرفين كأرقام عارية */
@@ -100,43 +138,29 @@ async function getAdminsNumbersCached(sock, groupId) {
   const cached = adminsCache.get(groupId);
   if (cached && (now - cached.ts) < ADMINS_TTL_MS) return cached.adminsNumbers;
 
-  const extract = (participants = []) =>
-    new Set(
-      (participants || [])
-        // في Baileys تكون القيمة 'admin' أو 'superadmin' أو undefined
-        .filter(p => !!p?.admin)
-        .map(p => bareNumber(normalizeUserJid(p.id)))
-    );
-
-  try {
-    const mdMin = await sock.groupMetadataMinimal(groupId);
-    const set = extract(mdMin?.participants);
-    adminsCache.set(groupId, { ts: now, adminsNumbers: set });
-    return set;
-  } catch {}
-  try {
-    const md = await sock.groupMetadata(groupId);
-    const set = extract(md?.participants);
-    adminsCache.set(groupId, { ts: now, adminsNumbers: set });
-    return set;
-  } catch {}
-  return new Set();
+  const set = await fetchAdminsSetStrict(sock, groupId);
+  adminsCache.set(groupId, { ts: now, adminsNumbers: set });
+  return set;
 }
 
-/** تحقّق لحظي أدقّ: هل المستخدم مشرف الآن؟ */
+/** تحقّق لحظي أدقّ: هل المستخدم مشرف الآن؟ (يجمع بين اللحظي والكاش) */
 async function isUserAdmin(sock, groupId, anyUserJid) {
   const targetBare = bareNumber(normalizeUserJid(anyUserJid));
+
+  // محاولة لحظية دقيقة
   try {
     const mdMin = await sock.groupMetadataMinimal(groupId);
     const p = (mdMin?.participants || []).find(x => bareNumber(normalizeUserJid(x.id)) === targetBare);
-    return !!p?.admin; // 'admin' | 'superadmin' | undefined
+    if (participantIsAdmin(p)) return true;
   } catch {}
+
   try {
     const md = await sock.groupMetadata(groupId);
     const p = (md?.participants || []).find(x => bareNumber(normalizeUserJid(x.id)) === targetBare);
-    return !!p?.admin;
+    if (participantIsAdmin(p)) return true;
   } catch {}
-  // كFallback: استخدم الكاش
+
+  // كاش
   const cached = await getAdminsNumbersCached(sock, groupId);
   return cached.has(targetBare);
 }
@@ -165,13 +189,9 @@ async function moderateGroupMessage(sock, m) {
   const settings = await GroupSettings.findOne({ groupId }).lean().catch(() => null);
   if (!settings?.enabled) return false;
 
-  const maxWarnings  = Math.max(1, Number(settings.maxWarnings || 3));
-  const exemptAdmins = settings?.exemptAdmins !== false; // افتراضيًا true
-
-  // استخرج المرسل بثبات: في القروبات يجب أن يوجد participant
+  // يجب أن يكون لدينا participant في رسائل القروبات
   const senderRaw = m.key?.participant || m.participant;
   if (!senderRaw) {
-    // كحالة نادرة جدًا، نتوقّف بدلًا من استخدام groupId
     logger.warn({ mKey: m?.key }, 'moderation: missing participant in group message');
     return false;
   }
@@ -179,14 +199,18 @@ async function moderateGroupMessage(sock, m) {
   const fromUserJid = normalizeUserJid(senderRaw);
   const senderBare  = bareNumber(fromUserJid);
 
-  // استثناء المشرفين (قطعي)
+  // === استثناء المشرفين (قطعي) ===
+  const exemptAdmins = settings?.exemptAdmins !== false; // افتراضيًا true
   if (exemptAdmins) {
     const adminNow = await isUserAdmin(sock, groupId, fromUserJid);
     if (adminNow) {
       logger.debug?.({ groupId, user: fromUserJid }, 'skip moderation: admin exempt');
-      return false;
+      return false; // لا حذف ولا تحذير ولا حظر
     }
   }
+
+  // إعدادات
+  const maxWarnings = Math.max(1, Number(settings.maxWarnings || 3));
 
   // كشف المخالفة
   const raw  = textFromMessage(m);
