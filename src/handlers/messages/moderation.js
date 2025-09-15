@@ -1,10 +1,10 @@
 // src/handlers/messages/moderation.js
-// موديريشن القروبات (نهائي):
-// - استثناء المشرفين اختياري عبر GroupSettings.exemptAdmins (إن true يتخطّاهم كليًا).
+// موديريشن القروبات (نسخة مُثبتة):
 // - يزيد عدّاد التحذيرات دائمًا عند المخالفة.
-// - يرسل رسالة التحذير حتى لو فشل حذف الرسالة.
-// - عند بلوغ الحد: يحاول الطرد مباشرةً باستخدام JID مطبّع (@s.whatsapp.net).
-// - لوج واضح عند فشل الحذف/الطرد لتشخيص المشكلات.
+// - يحذف رسالة المخالفة إن أمكن، ثم يرسل التحذير دائمًا.
+// - عند بلوغ الحد: يحاول الحظر باستخدام JID الفعلي من participants (قد يكون @lid).
+// - استثناء المشرفين اختياري عبر GroupSettings.exemptAdmins (true = استثناء).
+// - لوج واضح لتشخيص المشاكل.
 
 const GroupSettings = require('../../models/GroupSettings');
 const UserWarning   = require('../../models/UserWarning');
@@ -12,9 +12,9 @@ const { normalizeArabic, hasLink, isMediaMessage } = require('../../lib/arabic')
 const { normalizeUserJid, bareNumber } = require('../../lib/jid');
 const logger = require('../../lib/logger');
 
-const notAdminCooldown = new Map(); // groupId -> lastTs (لتقليل رسائل "عيّنني مشرف")
-const adminsCache      = new Map(); // groupId -> { ts, adminsNumbers: Set<string> }
-const ADMINS_TTL_MS    = 5 * 60 * 1000; // 5 دقائق
+const ADMINS_TTL_MS = 5 * 60 * 1000; // 5 دقائق
+const adminsCache   = new Map();      // groupId -> { ts, adminsNumbers:Set }
+const remind403     = new Map();      // groupId -> lastTs (تقليل رسائل "اجعلني مشرف")
 
 function textFromMessage(msg) {
   return (
@@ -26,17 +26,13 @@ function textFromMessage(msg) {
   ).trim();
 }
 
-/** إرسال آمن */
 async function safeSend(sock, jid, text, extra = {}) {
-  try {
-    await sock.sendMessage(jid, { text, ...extra });
-  } catch (e) {
-    logger.warn({ e, jid, text }, 'safeSend failed');
-  }
+  try { await sock.sendMessage(jid, { text, ...extra }); }
+  catch (e) { logger.warn({ e, jid, text }, 'safeSend failed'); }
 }
 
-/** حذف الرسالة إن أمكن؛ وإلا تذكير بالصلاحيات بشكل محدود */
-async function deleteForAllOrWarn(sock, m) {
+/** حذف رسالة المخالفة (إن أمكن). */
+async function deleteOffendingMessage(sock, m) {
   const groupId = m.key.remoteJid;
   try {
     await sock.sendMessage(groupId, {
@@ -44,28 +40,28 @@ async function deleteForAllOrWarn(sock, m) {
         remoteJid: groupId,
         fromMe: false,
         id: m.key.id,
-        participant: m.key.participant || m.participant, // ضروري في القروبات
+        participant: m.key.participant || m.participant, // ضروري في القروبات (قد يكون @lid)
       }
     });
     return true;
   } catch (e) {
-    const msg = String(e?.message || '').toLowerCase();
     const code = e?.data || e?.output?.statusCode;
+    const msg  = String(e?.message || '').toLowerCase();
     if (code === 403 || msg.includes('forbidden') || msg.includes('not-authorized')) {
-      const last = notAdminCooldown.get(groupId) || 0;
+      const last = remind403.get(groupId) || 0;
       const now  = Date.now();
       if (now - last > 10 * 60 * 1000) {
         await safeSend(sock, groupId, '⚠️ لتفعيل الحذف/الحظر يرجى ترقية البوت إلى *مشرف*.');
-        notAdminCooldown.set(groupId, now);
+        remind403.set(groupId, now);
       }
     } else {
-      logger.warn({ e }, 'deleteForAll failed');
+      logger.warn({ e }, 'deleteOffendingMessage failed');
     }
     return false;
   }
 }
 
-/** كاش المشرفين بالأرقام العارية */
+/** جلب كاش المشرفين كأرقام عارية (لاستثناءهم لو مطلوب). */
 async function getAdminsNumbersCached(sock, groupId) {
   const now = Date.now();
   const cached = adminsCache.get(groupId);
@@ -82,14 +78,14 @@ async function getAdminsNumbersCached(sock, groupId) {
     adminsCache.set(groupId, { ts: now, adminsNumbers: set });
     return set;
   } catch (e) {
-    logger.warn({ e, groupId }, 'getAdminsNumbersCached minimal failed; trying full');
+    logger.warn({ e, groupId }, 'getAdminsNumbersCached(minimal) failed, fallback full');
     try {
       const md = await sock.groupMetadata(groupId);
       const set = extract(md?.participants);
       adminsCache.set(groupId, { ts: now, adminsNumbers: set });
       return set;
     } catch (e2) {
-      logger.warn({ e2, groupId }, 'getAdminsNumbersCached full failed');
+      logger.warn({ e2, groupId }, 'getAdminsNumbersCached(full) failed');
       const empty = new Set();
       adminsCache.set(groupId, { ts: now, adminsNumbers: empty });
       return empty;
@@ -97,35 +93,58 @@ async function getAdminsNumbersCached(sock, groupId) {
   }
 }
 
+/**
+ * إيجاد JID الفعلي للعضو كما تراه واتساب في القروب (قد يكون @lid).
+ * نطابق بالرقم العاري، ثم نعيد participant.id كما هو.
+ */
+async function resolveParticipantJid(sock, groupId, anyUserJid) {
+  const targetBare = bareNumber(normalizeUserJid(anyUserJid));
+  try {
+    // minimal أخف عادة ويحتوي قائمة participants
+    const mdMin = await sock.groupMetadataMinimal(groupId);
+    const found = (mdMin?.participants || []).find(p =>
+      bareNumber(normalizeUserJid(p.id)) === targetBare
+    );
+    if (found?.id) return found.id;
+  } catch {}
+  try {
+    const md = await sock.groupMetadata(groupId);
+    const found = (md?.participants || []).find(p =>
+      bareNumber(normalizeUserJid(p.id)) === targetBare
+    );
+    if (found?.id) return found.id;
+  } catch {}
+  // فشلنا — أعِد JID مطبّعًا؛ قد ينجح أحيانًا
+  return normalizeUserJid(anyUserJid);
+}
+
 async function moderateGroupMessage(sock, m) {
   const groupId = m.key?.remoteJid;
   if (!groupId?.endsWith('@g.us')) return false;
 
-  // إعدادات القروب
   const settings = await GroupSettings.findOne({ groupId }).lean().catch(() => null);
   if (!settings?.enabled) return false;
 
-  const maxWarnings  = Math.max(1, Number(settings.maxWarnings || 3)); // حد أدنى 1
-  const exemptAdmins = settings.exemptAdmins === true; // إن true → لا نعالج المشرفين نهائيًا
+  const maxWarnings  = Math.max(1, Number(settings.maxWarnings || 3));
+  const exemptAdmins = settings.exemptAdmins === true;
 
-  // المرسل (طبع إلى @s.whatsapp.net)
+  // المرسل (نحوّل دائمًا إلى @s.whatsapp.net للحفظ في DB)
   const fromUserJid = normalizeUserJid(m.key?.participant || m.participant || '');
   if (!fromUserJid) return false;
 
-  // استثناء المشرفين (إن مفعّل)
+  // استثناء المشرفين (لو مفعل)
   if (exemptAdmins) {
     const adminsNumbers = await getAdminsNumbersCached(sock, groupId);
     if (adminsNumbers.has(bareNumber(fromUserJid))) {
-      logger.debug?.({ groupId, user: fromUserJid }, 'moderation skipped (admin exempt)');
+      logger.debug?.({ groupId, user: fromUserJid }, 'skip moderation: admin exempt');
       return false;
     }
   }
 
-  // محتوى الرسالة
+  // كشف المخالفة
   const raw  = textFromMessage(m);
   const norm = normalizeArabic(raw);
 
-  // هل هناك مخالفة؟
   let violated = false;
   if (!violated && settings.blockLinks && hasLink(raw)) violated = true;
   if (!violated && settings.blockMedia && isMediaMessage(m)) violated = true;
@@ -135,11 +154,11 @@ async function moderateGroupMessage(sock, m) {
   }
   if (!violated) return false;
 
-  // زد العدّاد دائمًا عند المخالفة
+  // ✳️ زد العداد دائمًا عند المخالفة
   let newCount = 1;
   try {
     const doc = await UserWarning.findOneAndUpdate(
-      { groupId, userId: fromUserJid },       // نخزن دائمًا بصيغة @s.whatsapp.net
+      { groupId, userId: fromUserJid }, // نخزن دائمًا بصيغة @s.whatsapp.net
       { $inc: { count: 1 } },
       { upsert: true, new: true }
     );
@@ -149,27 +168,29 @@ async function moderateGroupMessage(sock, m) {
     logger.warn({ e, groupId, user: fromUserJid }, 'warn counter inc failed');
   }
 
-  // حاول حذف الرسالة (ثم أرسل التحذير دائمًا)
-  await deleteForAllOrWarn(sock, m);
+  // نحذف رسالة المخالفة (إن أمكن) — لكن لن نوقف التحذير في كل الأحوال
+  await deleteOffendingMessage(sock, m);
 
+  // أرسل التحذير أو نفّذ الحظر
   if (newCount >= maxWarnings) {
-    // الطرد عند الحد
     try {
-      await sock.groupParticipantsUpdate(groupId, [fromUserJid], 'remove');
+      // استخدم JID الفعلي في participants (قد يكون @lid)
+      const participantJid = await resolveParticipantJid(sock, groupId, fromUserJid);
+
+      await sock.groupParticipantsUpdate(groupId, [participantJid], 'remove');
+
+      // نظّف السجل ثم أعلن الحظر
       await UserWarning.deleteOne({ groupId, userId: fromUserJid }).catch(() => {});
-      await safeSend(
-        sock,
-        groupId,
-        `🚫 تم حظر @${fromUserJid.split('@')[0]} بعد ${maxWarnings} مخالفات.`,
-        { mentions: [fromUserJid] }
-      );
+      await safeSend(sock, groupId, `🚫 تم حظر @${fromUserJid.split('@')[0]} بعد ${maxWarnings} مخالفات.`, {
+        mentions: [fromUserJid]
+      });
     } catch (e) {
       logger.warn({ e, groupId, user: fromUserJid }, 'kick user failed');
-      const last = notAdminCooldown.get(groupId) || 0;
+      const last = remind403.get(groupId) || 0;
       const now  = Date.now();
       if (now - last > 10 * 60 * 1000) {
-        await safeSend(sock, groupId, '⚠️ لا أستطيع الحظر بدون صلاحية *مشرف*.');
-        notAdminCooldown.set(groupId, now);
+        await safeSend(sock, groupId, '⚠️ لا أستطيع الحظر — تأكد أن البوت *مشرف* وله صلاحية إدارة الأعضاء.');
+        remind403.set(groupId, now);
       }
     }
   } else {
