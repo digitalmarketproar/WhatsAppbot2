@@ -1,5 +1,5 @@
 // src/handlers/messages/moderation.js
-// موديريشن القروبات مع استثناء دقيق للمشرفين ومنشن مضبوط.
+// موديريشن القروبات مع استثناء دقيق للمشرفين ومنشن مضبوط ومقاومة لاختلافات JID/LID.
 // يعتمد على: GroupSettings, UserWarning, logger, arabic.js, jid.js
 
 const GroupSettings = require('../../models/GroupSettings');
@@ -37,71 +37,19 @@ function textFromMessage(m = {}) {
   return '';
 }
 
-/** حذف الرسالة المخالفة */
-async function deleteOffendingMessage(sock, m) {
-  const groupId = m.key.remoteJid;
-  try {
-    await sock.sendMessage(groupId, {
-      delete: {
-        remoteJid: groupId,
-        fromMe: false,
-        id: m.key.id,
-        participant: m.key.participant || m.participant, // قد يكون @lid
-      },
-    });
-    return true;
-  } catch (e) {
-    const code = e?.data || e?.output?.statusCode;
-    const msg  = String(e?.message || '').toLowerCase();
-    if (code === 403 || msg.includes('forbidden') || msg.includes('not admin')) {
-      const last = remind403.get(groupId) || 0;
-      const now  = Date.now();
-      if (now - last > 10 * 60 * 1000) {
-        await safeSend(sock, groupId, { text: '⚠️ لا أستطيع حذف الرسائل — يجب أن أكون *مشرفًا*.' });
-        remind403.set(groupId, now);
-      }
-    } else {
-      logger.warn({ e }, 'deleteOffendingMessage failed');
-    }
-    return false;
-  }
-}
-
-/** استخرج الرقم من JID (بدون مسافات/أجهزة) */
-function numberFromJid(jid = '') {
-  const beforeAt = String(jid).split('@')[0] || '';
-  return beforeAt.split(':')[0];
-}
-
-/** جلب اسم سريع من كاش الاتصالات؛ وإلا نعيد null (المنشن يتكفّل بالرقم) */
-function getDisplayNameFast(sock, jid) {
-  try {
-    const c = sock?.contacts?.[jid] || null;
-    const name = c?.name || c?.verifiedName || c?.notify || null;
-    return name && String(name).trim() ? String(name).trim() : null;
-  } catch {
-    return null;
-  }
-}
-
-/** إبني سطر منشن مضبوط: دائمًا @الرقم، وإن وُجد اسم بشري أضِفه */
-function buildMentionLine(displayName, bareNum) {
-  const clean = String(bareNum).replace(/\D/g, '');
-  const looksNumeric = /^\+?\d[\d\s]*$/.test(displayName || '');
-  if (!displayName || looksNumeric) return `@${clean}`;
-  return `@${clean} — *${displayName}*`;
-}
-
-/** هل المشارك مشرف؟ (تطبيع تعدد الأشكال) */
+/** هل المشارك مشرف؟ (تحمّل صيغ متعددة) */
 function participantIsAdmin(p) {
-  // بعض الإصدارات: p.admin = 'admin' | 'superadmin' | undefined
-  // أخرى: p.admin = true/false أو p.isAdmin = true/false
   if (!p) return false;
   if (p.isAdmin === true) return true;
-  if (typeof p.admin === 'boolean') return p.admin;
+  if (typeof p.admin === 'boolean') return p.admin === true;
   if (typeof p.admin === 'string') {
     const v = p.admin.toLowerCase();
-    return v === 'admin' || v === 'superadmin';
+    return v === 'admin' || v === 'superadmin' || v === 'owner';
+  }
+  // دعم محتمل لصيغ مستقبلية: roles: ['admin', 'owner']
+  if (Array.isArray(p.roles)) {
+    const roles = p.roles.map(r => String(r).toLowerCase());
+    if (roles.includes('admin') || roles.includes('superadmin') || roles.includes('owner')) return true;
   }
   return false;
 }
@@ -181,6 +129,55 @@ async function resolveParticipantJid(sock, groupId, anyUserJid) {
   return normalizeUserJid(anyUserJid);
 }
 
+/** حذف الرسالة المخالفة (باستخدام JID الفعلي دائمًا) */
+async function deleteOffendingMessage(sock, m, realParticipantJid) {
+  const groupId = m.key.remoteJid;
+  try {
+    await sock.sendMessage(groupId, {
+      delete: {
+        remoteJid: groupId,
+        fromMe: false,
+        id: m.key.id,
+        participant: realParticipantJid || m.key.participant || m.participant, // نفضّل الحقيقي
+      },
+    });
+    return true;
+  } catch (e) {
+    const code = e?.data || e?.output?.statusCode;
+    const msg  = String(e?.message || '').toLowerCase();
+    if (code === 403 || msg.includes('forbidden') || msg.includes('not admin')) {
+      const last = remind403.get(groupId) || 0;
+      const now  = Date.now();
+      if (now - last > 10 * 60 * 1000) {
+        await safeSend(sock, groupId, { text: '⚠️ لا أستطيع حذف الرسائل — يجب أن أكون *مشرفًا*.' });
+        remind403.set(groupId, now);
+      }
+    } else {
+      logger.warn({ e }, 'deleteOffendingMessage failed');
+    }
+    return false;
+  }
+}
+
+/** جلب اسم سريع من كاش الاتصالات؛ وإلا نعيد null (المنشن يتكفّل بالرقم) */
+function getDisplayNameFast(sock, jid) {
+  try {
+    const c = sock?.contacts?.[jid] || null;
+    const name = c?.name || c?.verifiedName || c?.notify || null;
+    return name && String(name).trim() ? String(name).trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+/** إبني سطر منشن مضبوط: دائمًا @الرقم، وإن وُجد اسم بشري أضِفه */
+function buildMentionLine(displayName, bareNum) {
+  const clean = String(bareNum).replace(/\D/g, '');
+  const looksNumeric = /^\+?\d[\d\s]*$/.test(displayName || '');
+  if (!displayName || looksNumeric) return `@${clean}`;
+  return `@${clean} — *${displayName}*`;
+}
+
 /** المعالجة الأساسية للرسائل في القروبات */
 async function moderateGroupMessage(sock, m) {
   const groupId = m?.key?.remoteJid;
@@ -196,15 +193,17 @@ async function moderateGroupMessage(sock, m) {
     return false;
   }
 
+  // طبّع الـJID ثم اكتشف الـJID الحقيقي المسجّل في القروب (LID-safe)
   const fromUserJid = normalizeUserJid(senderRaw);
   const senderBare  = bareNumber(fromUserJid);
+  const realParticipantJid = await resolveParticipantJid(sock, groupId, fromUserJid);
 
   // === استثناء المشرفين (قطعي) ===
   const exemptAdmins = settings?.exemptAdmins !== false; // افتراضيًا true
   if (exemptAdmins) {
-    const adminNow = await isUserAdmin(sock, groupId, fromUserJid);
+    const adminNow = await isUserAdmin(sock, groupId, realParticipantJid);
     if (adminNow) {
-      logger.debug?.({ groupId, user: fromUserJid }, 'skip moderation: admin exempt');
+      logger.debug?.({ groupId, user: realParticipantJid }, 'skip moderation: admin exempt (initial)');
       return false; // لا حذف ولا تحذير ولا حظر
     }
   }
@@ -225,45 +224,64 @@ async function moderateGroupMessage(sock, m) {
   }
   if (!violated) return false;
 
+  // --- Double-Check قبل أي إجراء: حماية ضد أخطاء مؤقتة/كاش ---
+  if (exemptAdmins) {
+    const stillAdmin = await isUserAdmin(sock, groupId, realParticipantJid);
+    if (stillAdmin) {
+      logger.debug?.({ groupId, user: realParticipantJid }, 'abort action: admin exempt (double-check)');
+      return false;
+    }
+  }
+
   // عدّاد التحذيرات
   let newCount = 1;
   try {
     const doc = await UserWarning.findOneAndUpdate(
-      { groupId, userId: fromUserJid },
+      { groupId, userId: realParticipantJid }, // استخدم الـJID الفعلي ضمانًا للاتساق
       { $inc: { count: 1 } },
       { upsert: true, new: true, setDefaultsOnInsert: true }
     );
     newCount = doc?.count || 1;
-    logger.debug?.({ groupId, user: fromUserJid, count: newCount }, 'warning incremented');
+    logger.debug?.({ groupId, user: realParticipantJid, count: newCount }, 'warning incremented');
   } catch (e) {
-    logger.warn({ e, groupId, user: fromUserJid }, 'warn counter inc failed');
+    logger.warn({ e, groupId, user: realParticipantJid }, 'warn counter inc failed');
   }
 
   // بناء المنشن: @الرقم (دائمًا) + اسم إن توفر
-  const displayFast = getDisplayNameFast(sock, fromUserJid);
+  const displayFast = getDisplayNameFast(sock, realParticipantJid);
   const mentionText = buildMentionLine(displayFast, senderBare);
 
   // جهّز mentions بالـJID الحقيقي (@lid لو لازم)
-  const realParticipantJid = await resolveParticipantJid(sock, groupId, fromUserJid);
   const mentionsArr = [realParticipantJid];
 
-  // احذف المخالفة أولًا (إن أمكن)
-  await deleteOffendingMessage(sock, m);
+  // احذف المخالفة أولًا (إن أمكن) — مع استخدام الـJID الفعلي
+  await deleteOffendingMessage(sock, m, realParticipantJid);
 
   if (newCount >= maxWarnings) {
-    // حظر (طالما ليس مشرفًا — تمت التصفية مسبقًا)
+    // حماية إضافية: لا تحاول طرد مشرف حتى لو تغيّر خلال التنفيذ
+    if (exemptAdmins) {
+      const adminNow = await isUserAdmin(sock, groupId, realParticipantJid);
+      if (adminNow) {
+        // امسح العدّاد إن رغبت بالتسامح الكامل مع المشرفين
+        await UserWarning.deleteOne({ groupId, userId: realParticipantJid }).catch(() => {});
+        logger.info({ groupId, user: realParticipantJid }, 'skip kick: turned out admin at final check');
+        return true; // اعتبرناها معالجة تمت بدون إجراء تأديبي
+      }
+    }
+
+    // حظر (طالما ليس مشرفًا — تم التأكد أعلاه)
     try {
       await sock.groupParticipantsUpdate(groupId, [realParticipantJid], 'remove');
-      await UserWarning.deleteOne({ groupId, userId: fromUserJid }).catch(() => {});
+      await UserWarning.deleteOne({ groupId, userId: realParticipantJid }).catch(() => {});
       await safeSend(
         sock,
         groupId,
         { text: `🚫 تم حظر ${mentionText} بعد ${maxWarnings} مخالفات.`, mentions: mentionsArr },
         { quoted: m }
       );
-      logger.info({ groupId, user: fromUserJid, participantJid: realParticipantJid }, 'kick success');
+      logger.info({ groupId, user: realParticipantJid }, 'kick success');
     } catch (e) {
-      logger.warn({ e, groupId, user: fromUserJid }, 'kick user failed');
+      logger.warn({ e, groupId, user: realParticipantJid }, 'kick user failed');
       const last = remind403.get(groupId) || 0;
       const now  = Date.now();
       if (now - last > 10 * 60 * 1000) {
@@ -279,7 +297,7 @@ async function moderateGroupMessage(sock, m) {
       { text: `⚠️ المخالفة ${newCount}/${maxWarnings}: ${mentionText}، الرجاء الالتزام بالقوانين.`, mentions: mentionsArr },
       { quoted: m }
     );
-    logger.info({ groupId, user: fromUserJid, count: newCount }, 'warning message sent');
+    logger.info({ groupId, user: realParticipantJid, count: newCount }, 'warning message sent');
   }
 
   return true;
