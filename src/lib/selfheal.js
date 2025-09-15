@@ -1,37 +1,25 @@
 // src/lib/selfheal.js
-// Self-Heal محسّن لأخطاء التشفير في Baileys/libsignal:
-// - Bad MAC
-// - No session found / No matching sessions
-// - Invalid PreKey ID
-// الاستراتيجية: Retry → عدّاد فشل لكل جهة → Purge انتقائي ثنائي (lid + pn) + sender-keys → Resync خفيف
-// ⚠️ لا نلمس app-state-sync-key إطلاقًا.
+// Self-Heal لأخطاء libsignal/Baileys:
+// - Bad MAC / No session found / Invalid PreKey ID
+// يستهدف كل هويات المرسل المحتملة (remoteJid + senderLid + participantPn)
+// ويطبّق: Retry → عدّاد → Purge جلسات مستهدفة (+ sender-keys للمجموعات) → Resync خفيف.
 
 const mongoose = require('mongoose');
 const logger = require('./logger');
 
 const KEY_COLL_NAME = process.env.BAILEYS_KEY_COLLECTION || 'BaileysKey';
-const consecutiveFails = new Map(); // مفتاح العدّاد يمكن أن يضم أكثر من JID لذات الجهة
+const consecutiveFails = new Map();
 
-function escapeReg(s) {
-  return String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
+function escapeReg(s) { return String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+function coreOf(jid)  { const s = String(jid || ''); const i = s.indexOf('@'); return i === -1 ? s : s.slice(0, i); }
 
-// تبسيط استخراج core قبل @
-function coreOf(jid) {
-  const s = String(jid || '');
-  const i = s.indexOf('@');
-  return i === -1 ? s : s.slice(0, i);
-}
-
-// ⚠️ لا تلمس app-state-sync-key هنا
 async function purgeSessionForJid(jid) {
   try {
     const sJid = String(jid || '');
     if (!sJid || sJid === 'status@broadcast') return;
 
-    const core = coreOf(sJid);
     const col  = mongoose.connection.collection(KEY_COLL_NAME);
-
+    const core = coreOf(sJid);
     const patterns = [
       `^session:${escapeReg(sJid)}$`,
       `^session:${escapeReg(core)}(@.+)?$`,
@@ -54,17 +42,15 @@ async function purgeSessionForJid(jid) {
 async function purgeSenderKeysFor(groupJid, participantJid) {
   try {
     const g = String(groupJid || '');
-    if (!g.endsWith('@g.us')) return;
+    if (!g.endsWith('@g.us')) return; // فقط في القروبات
     const p = String(participantJid || '');
     const col = mongoose.connection.collection(KEY_COLL_NAME);
 
-    // id: "sender-key-<groupJid>::<deviceJid>::<iter>" — نوسّع regex لاحتمالات مختلفة
     const groupPat = `^sender-key-${escapeReg(g)}(::|:)`;
     const orConds = p
       ? [
           { id:  { $regex: `${groupPat}.*${escapeReg(p)}(::|:)` } },
           { _id: { $regex: `${groupPat}.*${escapeReg(p)}(::|:)` } },
-          // احتياط: ربما تُخزَّن بـcore فقط
           { id:  { $regex: `${groupPat}.*${escapeReg(coreOf(p))}(@.*)?(::|:)` } },
           { _id: { $regex: `${groupPat}.*${escapeReg(coreOf(p))}(@.*)?(::|:)` } },
         ]
@@ -90,28 +76,31 @@ async function requestRetry(sock, key) {
   }
 }
 
-// مفتاح عدّاد موحّد قد يجمع أكثر من مُعرّف لنفس الجهة (lid + pn)
+// مفتاح عدّاد مركّب: يشمل كل المعرفات المتاحة لنفس الجهة
 function counterKeyFrom(mOrU) {
   const k = mOrU?.key || mOrU || {};
   const parts = [
     k.participant || '',
-    k.participantPn || '', // بعض البيئات تضيف هذا الحقل داخل key
+    k.participantPn || '',
+    k.senderLid || '',
     k.remoteJid || '',
   ].filter(Boolean);
-  return parts.join('|'); // مفتاح مركّب
+  return parts.join('|');
 }
 
-// نستخرج ثنائية (lid + pn) إن توفرت: من الرسالة أو التحديث
-function extractDualIds(mOrU) {
+// استخرج كل المرشحين الممكنين للتنظيف
+function extractCandidates(mOrU) {
   const k = mOrU?.key || mOrU || {};
-  const participantLid = k.participant && String(k.participant).includes('@lid') ? k.participant : '';
-  const participantPn  = k.participantPn || '';
-  const remote         = k.remoteJid || '';
-  return { participantLid, participantPn, remoteJid: remote };
+  const candidates = [];
+  if (k.participant)   candidates.push(k.participant);
+  if (k.participantPn) candidates.push(k.participantPn);
+  if (k.senderLid)     candidates.push(k.senderLid);
+  if (k.remoteJid)     candidates.push(k.remoteJid);
+  return Array.from(new Set(candidates.filter(Boolean)));
 }
 
 function registerSelfHeal(sock, { messageStore } = {}) {
-  // تأمين getMessage لدعم retry
+  // دعم retry: توفير getMessage
   if (typeof sock.getMessage !== 'function') {
     sock.getMessage = async (key) => {
       const id = key?.id;
@@ -119,7 +108,7 @@ function registerSelfHeal(sock, { messageStore } = {}) {
     };
   }
 
-  // خزن الرسائل الجديدة واصفر العدّاد
+  // خزّن الرسائل الجديدة واصفر العدّاد
   sock.ev.on('messages.upsert', async ({ messages }) => {
     if (!Array.isArray(messages)) return;
     for (const m of messages) {
@@ -144,7 +133,6 @@ function registerSelfHeal(sock, { messageStore } = {}) {
         const chatId = key?.remoteJid || '';
         if (chatId === 'status@broadcast') continue;
 
-        // اجمع كل الأخطاء في نص واحد
         const errs = []
           .concat(u?.errors || [])
           .concat(u?.error ? [u.error] : [])
@@ -152,9 +140,9 @@ function registerSelfHeal(sock, { messageStore } = {}) {
           .join(' | ')
           .toLowerCase();
 
-        const badMac      = /bad\s*mac/.test(errs);
-        const noSess      = /no (matching )?sessions? found/.test(errs) || /no session found/.test(errs);
-        const invalidPre  = /invalid\s*prekey\s*id/.test(errs);
+        const badMac     = /bad\s*mac/.test(errs);
+        const noSess     = /no (matching )?sessions? found/.test(errs) || /no session found/.test(errs);
+        const invalidPre = /invalid\s*prekey\s*id/.test(errs);
 
         if (badMac || noSess || invalidPre) {
           // 1) اطلب إعادة الإرسال
@@ -165,34 +153,27 @@ function registerSelfHeal(sock, { messageStore } = {}) {
           const fails = (consecutiveFails.get(ck) || 0) + 1;
           consecutiveFails.set(ck, fails);
 
-          // 3) بعد محاولتين فاشلتين: purge ثنائي (lid + pn) + sender-keys
+          // 3) بعد محاولتين: نظّف كل المرشحين (يغطي الخاص + القروبات)
           if (fails >= 2) {
-            const { participantLid, participantPn, remoteJid } = extractDualIds(u);
+            const candidates = extractCandidates(u); // قد تتضمن senderLid / participantPn / remoteJid
+            for (const jid of candidates) {
+              await purgeSessionForJid(jid);
+              // إن كانت رسالة ضمن مجموعة: نظّف sender-keys للمجموعة لهذا المشارك
+              if (String(chatId).endsWith('@g.us')) {
+                await purgeSenderKeysFor(chatId, jid);
+              }
+            }
 
-            // نظّف جلسات كل المعرفات المتاحة
-            await purgeSessionForJid(participantLid || remoteJid);
-            if (participantPn) await purgeSessionForJid(participantPn);
-
-            // نظّف مفاتيح المجموعة: جرّب بالحالتين
-            await purgeSenderKeysFor(remoteJid, participantLid || '');
-            if (participantPn) await purgeSenderKeysFor(remoteJid, participantPn);
-
-            // resync خفيف
             try {
               await sock.resyncAppState?.(['critical_unblock_low', 'regular_high']);
             } catch (e) {
               logger.warn({ e }, 'resync after purge failed');
             }
-
             consecutiveFails.delete(ck);
           }
 
-          logger.warn(
-            { key, fails: consecutiveFails.get(ck), badMac, noSess, invalidPre },
-            'selfheal: decryption error handled'
-          );
+          logger.warn({ key, fails: consecutiveFails.get(ck), badMac, noSess, invalidPre }, 'selfheal: decryption error handled');
         } else if (u?.message) {
-          // نجاح فك التشفير → صفّر العدّاد
           consecutiveFails.delete(counterKeyFrom(u));
         }
       } catch (e) {
