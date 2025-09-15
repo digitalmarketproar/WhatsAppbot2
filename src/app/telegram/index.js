@@ -1,3 +1,4 @@
+// src/app/telegram/index.js
 const TelegramBot = require('node-telegram-bot-api');
 const QRCode = require('qrcode');
 const logger = require('../../lib/logger');
@@ -9,6 +10,9 @@ const registerToggleCommands   = require('./modules/toggles');
 const registerBanwordCommands  = require('./modules/banwords');
 const registerStatusCommands   = require('./modules/status');
 const registerHelpCommand      = require('./modules/help');
+
+// ✅ إضافة وحدة إدارة القائمة البيضاء
+const registerWhitelistCommands = require('./modules/whitelist');
 
 function startTelegram(token, adminId) {
   if (!token || !adminId) return null;
@@ -47,6 +51,9 @@ function startTelegram(token, adminId) {
   registerToggleCommands(ctx);
   registerBanwordCommands(ctx);
   registerStatusCommands(ctx);
+
+  // ✅ أوامر القائمة البيضاء
+  registerWhitelistCommands(ctx);
 
   bot.on('polling_error', (err) => {
     if (String(err?.message || '').includes('409')) return; // WebHook conflict
