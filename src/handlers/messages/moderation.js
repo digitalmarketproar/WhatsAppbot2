@@ -1,10 +1,17 @@
 // src/handlers/messages/moderation.js
-// موديريشن القروبات (تلوين مضمون بدون تكرار المعرف):
-// - يضمن التلوين بتمرير mentions ووجود @الرقم بالنص عند الحاجة.
-// - لا يكرر المعرّف: إن كان displayName رقميًا → نعرض @الرقم فقط. غير ذلك → @الرقم — *الاسم*.
-// - يحذف رسالة المخالفة أولًا (للخفة) ثم يرد بالتحذير/الحظر.
-// - يستخدم JID الفعلي (@lid) للطرد عند الحاجة.
-// - يدعم استثناء المشرفين عبر GroupSettings.exemptAdmins.
+// موديريشن القروبات مع منشن صحيح واسم/رقم واضح، واستثناء للمشرفين.
+//
+// ✅ الميزات:
+// - حذف رسالة المخالفة أولًا لتخفيف التشويش.
+// - تحذير 1..N ثم حظر في التحذير N (افتراضيًا 3).
+// - منشن صحيح عبر تمرير mentions + كتابة @الرقم في النص.
+// - عرض الاسم إن توفر وإلا نعرض الرقم.
+// - استثناء المشرفين (مفعّل افتراضيًا عبر GroupSettings.exemptAdmins).
+// - التعامل مع JID بنمط @lid أو @s.whatsapp.net بشكل صحيح.
+//
+// ملاحظات:
+// - يعتمد على: GroupSettings, UserWarning, logger, arabic.js, jid.js
+// - مكتبة Baileys: sock.sendMessage / groupMetadata / groupParticipantsUpdate.
 
 const GroupSettings = require('../../models/GroupSettings');
 const UserWarning   = require('../../models/UserWarning');
@@ -12,30 +19,37 @@ const { normalizeArabic, hasLink, isMediaMessage } = require('../../lib/arabic')
 const { normalizeUserJid, bareNumber } = require('../../lib/jid');
 const logger = require('../../lib/logger');
 
-const ADMINS_TTL_MS = 5 * 60 * 1000; // 5 دقائق
-const adminsCache   = new Map();      // groupId -> { ts, adminsNumbers:Set }
-const remind403     = new Map();      // groupId -> lastTs (لتقليل رسائل "عينني مشرف")
+// حافظات بسيطة
+const ADMINS_TTL_MS = 5 * 60 * 1000;   // 5 دقائق
+const adminsCache   = new Map();        // groupId -> { ts, adminsNumbers:Set }
+const remind403     = new Map();        // groupId -> lastTs (لتنبيه أن البوت ليس مشرفًا أحيانًا)
 
-function textFromMessage(msg) {
-  return (
-    msg?.message?.conversation ||
-    msg?.message?.extendedTextMessage?.text ||
-    msg?.message?.imageMessage?.caption ||
-    msg?.message?.videoMessage?.caption ||
-    ''
-  ).trim();
-}
-
+/** إرسال آمن */
 async function safeSend(sock, jid, content, extra = {}) {
   try {
-    const payload = typeof content === 'string' ? { text: content } : content;
-    await sock.sendMessage(jid, payload, extra);
+    await sock.sendMessage(jid, content, extra);
   } catch (e) {
     logger.warn({ e, jid, content }, 'safeSend failed');
   }
 }
 
-/** حذف رسالة المخالفة (إن أمكن). */
+/** استخراج نص الرسالة الخام */
+function textFromMessage(m = {}) {
+  const msg = m.message || {};
+  if (typeof msg.conversation === 'string') return msg.conversation;
+  if (msg.extendedTextMessage && msg.extendedTextMessage.text) return msg.extendedTextMessage.text;
+  if (msg.imageMessage && msg.imageMessage.caption) return msg.imageMessage.caption;
+  if (msg.videoMessage && msg.videoMessage.caption) return msg.videoMessage.caption;
+  if (msg.documentMessage && msg.documentMessage.caption) return msg.documentMessage.caption;
+  // جرّب أي حقل نصي معروف آخر
+  for (const k of Object.keys(msg)) {
+    const v = msg[k];
+    if (v && typeof v.text === 'string') return v.text;
+  }
+  return '';
+}
+
+/** حذف الرسالة المخالفة */
 async function deleteOffendingMessage(sock, m) {
   const groupId = m.key.remoteJid;
   try {
@@ -45,17 +59,18 @@ async function deleteOffendingMessage(sock, m) {
         fromMe: false,
         id: m.key.id,
         participant: m.key.participant || m.participant, // قد يكون @lid
-      }
+      },
     });
     return true;
   } catch (e) {
     const code = e?.data || e?.output?.statusCode;
     const msg  = String(e?.message || '').toLowerCase();
-    if (code === 403 || msg.includes('forbidden') || msg.includes('not-authorized')) {
+    if (code === 403 || msg.includes('forbidden') || msg.includes('not admin')) {
+      // ليس مشرفًا — لا تكرر التنبيه كثيرًا
       const last = remind403.get(groupId) || 0;
       const now  = Date.now();
       if (now - last > 10 * 60 * 1000) {
-        await safeSend(sock, groupId, '⚠️ لتفعيل الحذف/الحظر يرجى ترقية البوت إلى *مشرف*.');
+        await safeSend(sock, groupId, { text: '⚠️ لا أستطيع حذف الرسائل — يجب أن أكون *مشرفًا*.' });
         remind403.set(groupId, now);
       }
     } else {
@@ -65,7 +80,7 @@ async function deleteOffendingMessage(sock, m) {
   }
 }
 
-/** كاش المشرفين كأرقام عارية (لاستثناءهم لو مطلوب). */
+/** كاش المشرفين كأرقام عارية لسرعة التحقق من الإعفاء */
 async function getAdminsNumbersCached(sock, groupId) {
   const now = Date.now();
   const cached = adminsCache.get(groupId);
@@ -73,7 +88,9 @@ async function getAdminsNumbersCached(sock, groupId) {
 
   const extract = (participants = []) =>
     new Set(
-      participants.filter(p => p?.admin).map(p => bareNumber(normalizeUserJid(p.id)))
+      participants
+        .filter(p => p?.admin) // Baileys يضع admin=true للمشرفين
+        .map(p => bareNumber(normalizeUserJid(p.id)))
     );
 
   try {
@@ -81,23 +98,17 @@ async function getAdminsNumbersCached(sock, groupId) {
     const set = extract(mdMin?.participants);
     adminsCache.set(groupId, { ts: now, adminsNumbers: set });
     return set;
-  } catch (e) {
-    logger.warn({ e, groupId }, 'getAdminsNumbersCached(minimal) failed, fallback full');
-    try {
-      const md = await sock.groupMetadata(groupId);
-      const set = extract(md?.participants);
-      adminsCache.set(groupId, { ts: now, adminsNumbers: set });
-      return set;
-    } catch (e2) {
-      logger.warn({ e2, groupId }, 'getAdminsNumbersCached(full) failed');
-      const empty = new Set();
-      adminsCache.set(groupId, { ts: now, adminsNumbers: empty });
-      return empty;
-    }
-  }
+  } catch {}
+  try {
+    const md = await sock.groupMetadata(groupId);
+    const set = extract(md?.participants);
+    adminsCache.set(groupId, { ts: now, adminsNumbers: set });
+    return set;
+  } catch {}
+  return new Set();
 }
 
-/** جلب الاسم الظاهر من المشاركين ثم getName ثم fallback للرقم (+...). */
+/** جلب اسم العرض من القروب، ثم getName، ثم رجوع لرقم +XXXXXXXX */
 async function getDisplayNameInGroup(sock, groupId, anyUserJid) {
   const targetBare = bareNumber(normalizeUserJid(anyUserJid));
   try {
@@ -121,50 +132,46 @@ async function getDisplayNameInGroup(sock, groupId, anyUserJid) {
   return '+' + targetBare;
 }
 
-/** إيجاد JID الفعلي للعضو كما يراه واتساب في القروب (قد يكون @lid). */
+/** إيجاد معرف العضو الحقيقي كما يراه واتساب في القروب (قد يكون @lid) */
 async function resolveParticipantJid(sock, groupId, anyUserJid) {
   const targetBare = bareNumber(normalizeUserJid(anyUserJid));
   try {
     const mdMin = await sock.groupMetadataMinimal(groupId);
-    const found = (mdMin?.participants || []).find((p) =>
-      bareNumber(normalizeUserJid(p.id)) === targetBare
-    );
+    const found = (mdMin?.participants || []).find((p) => bareNumber(normalizeUserJid(p.id)) === targetBare);
     if (found?.id) return found.id;
   } catch {}
   try {
     const md = await sock.groupMetadata(groupId);
-    const found = (md?.participants || []).find((p) =>
-      bareNumber(normalizeUserJid(p.id)) === targetBare
-    );
+    const found = (md?.participants || []).find((p) => bareNumber(normalizeUserJid(p.id)) === targetBare);
     if (found?.id) return found.id;
   } catch {}
-  return normalizeUserJid(anyUserJid); // آخر الحلول
+  return normalizeUserJid(anyUserJid);
 }
 
-/** يبني نص منشن لا يكرر المعرّف. */
+/** يبني نص منشن لا يكرر المعرف: إن كان الاسم رقمًا، فقط @الرقم؛ غير ذلك @الرقم — *الاسم* */
 function buildMentionLine(displayName, bareNum) {
   const looksNumeric = /^\+?\d[\d\s]*$/.test(displayName || '');
-  // إن كان الاسم رقميًا (أو غير متاح) → نعرض @الرقم فقط (تلوين مضمون ولا تكرار)
   if (looksNumeric) return `@${bareNum}`;
-  // إن كان الاسم نصيًا → نعرض @الرقم مرة واحدة + الاسم (لا نكرّره)
   return `@${bareNum} — *${displayName}*`;
 }
 
+/** المعالجة الأساسية للرسائل في القروبات */
 async function moderateGroupMessage(sock, m) {
-  const groupId = m.key?.remoteJid;
+  const groupId = m?.key?.remoteJid;
   if (!groupId?.endsWith('@g.us')) return false;
 
   const settings = await GroupSettings.findOne({ groupId }).lean().catch(() => null);
   if (!settings?.enabled) return false;
 
   const maxWarnings  = Math.max(1, Number(settings.maxWarnings || 3));
-  const exemptAdmins = settings.exemptAdmins === true;
+  // ✅ افتراضيًا: إعفاء المشرفين (إلا إذا ضُبط صراحةً على false في DB)
+  const exemptAdmins = settings?.exemptAdmins !== false;
 
-  // المرسل (نحوّل دائمًا إلى @s.whatsapp.net للحفظ في DB)
-  const fromUserJid = normalizeUserJid(m.key?.participant || m.participant || '');
+  // المرسل (نحوّل إلى @s.whatsapp.net للحفظ والثبات)
+  const fromUserJid = normalizeUserJid(m.key?.participant || m.participant || m.key?.remoteJid || '');
   if (!fromUserJid) return false;
 
-  // استثناء المشرفين (لو مفعل)
+  // إعفاء المشرفين إن كان مفعّلًا
   if (exemptAdmins) {
     const adminsNumbers = await getAdminsNumbersCached(sock, groupId);
     if (adminsNumbers.has(bareNumber(fromUserJid))) {
@@ -186,13 +193,13 @@ async function moderateGroupMessage(sock, m) {
   }
   if (!violated) return false;
 
-  // ✳️ زد العداد دائمًا عند المخالفة
+  // عدّاد التحذيرات
   let newCount = 1;
   try {
     const doc = await UserWarning.findOneAndUpdate(
-      { groupId, userId: fromUserJid }, // نخزن دائمًا بصيغة @s.whatsapp.net
+      { groupId, userId: fromUserJid },
       { $inc: { count: 1 } },
-      { upsert: true, new: true }
+      { upsert: true, new: true, setDefaultsOnInsert: true }
     );
     newCount = doc?.count || 1;
     logger.debug?.({ groupId, user: fromUserJid, count: newCount }, 'warning incremented');
@@ -200,46 +207,34 @@ async function moderateGroupMessage(sock, m) {
     logger.warn({ e, groupId, user: fromUserJid }, 'warn counter inc failed');
   }
 
-  // جهّز الاسم + المنشن
+  const bare = bareNumber(fromUserJid);
   const displayName = await getDisplayNameInGroup(sock, groupId, fromUserJid);
-  const bare        = bareNumber(fromUserJid);
   const mentionLine = buildMentionLine(displayName, bare);
-  const mentionsArr = [fromUserJid]; // لإجبار التلوين
+  const mentionsArr = [normalizeUserJid(fromUserJid)]; // لإجبار التلوين الصحيح
 
-  // 🗑️ احذف أولًا (للخفة) ثم أرسل التحذير/الحظر
+  // احذف المخالفة أولًا
   await deleteOffendingMessage(sock, m);
 
   if (newCount >= maxWarnings) {
-    // 🟥 الحظر: طرد ثم إعلان
+    // حظر
     try {
       const participantJid = await resolveParticipantJid(sock, groupId, fromUserJid);
       await sock.groupParticipantsUpdate(groupId, [participantJid], 'remove');
       await UserWarning.deleteOne({ groupId, userId: fromUserJid }).catch(() => {});
-
-      await safeSend(
-        sock,
-        groupId,
-        { text: `🚫 تم حظر ${mentionLine} بعد ${maxWarnings} مخالفات.`, mentions: mentionsArr },
-        { quoted: m }
-      );
+      await safeSend(sock, groupId, { text: `🚫 تم حظر ${mentionLine} بعد ${maxWarnings} مخالفات.`, mentions: mentionsArr }, { quoted: m });
       logger.info({ groupId, user: fromUserJid, participantJid }, 'kick success');
     } catch (e) {
       logger.warn({ e, groupId, user: fromUserJid }, 'kick user failed');
       const last = remind403.get(groupId) || 0;
       const now  = Date.now();
       if (now - last > 10 * 60 * 1000) {
-        await safeSend(sock, groupId, '⚠️ لا أستطيع الحظر — تأكد أن البوت *مشرف* وله صلاحية إدارة الأعضاء.');
+        await safeSend(sock, groupId, { text: '⚠️ لا أستطيع الحظر — تأكد أنني *مشرف* ولدي صلاحية إدارة الأعضاء.' });
         remind403.set(groupId, now);
       }
     }
   } else {
-    // 🟨 التحذير
-    await safeSend(
-      sock,
-      groupId,
-      { text: `⚠️ المخالفة ${newCount}/${maxWarnings}: ${mentionLine}، الرجاء الالتزام بالقوانين.`, mentions: mentionsArr },
-      { quoted: m }
-    );
+    // تحذير
+    await safeSend(sock, groupId, { text: `⚠️ المخالفة ${newCount}/${maxWarnings}: ${mentionLine}، الرجاء الالتزام بالقوانين.`, mentions: mentionsArr }, { quoted: m });
     logger.info({ groupId, user: fromUserJid, count: newCount }, 'warning message sent');
   }
 
