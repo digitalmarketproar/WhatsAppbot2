@@ -3,13 +3,12 @@ const QRCode = require('qrcode');
 const logger = require('../../lib/logger');
 
 const registerIgnoreCommands   = require('./modules/ignore');
-const registerGroupCommands   = require('./modules/group');
-const registerRulesCommands   = require('./modules/rules');
-const registerToggleCommands  = require('./modules/toggles');
-const registerBanwordCommands = require('./modules/banwords');
-const registerWarnsCommands   = require('./modules/warns');
-const registerStatusCommands  = require('./modules/status');
-const registerHelpCommand     = require('./modules/help');
+const registerGroupCommands    = require('./modules/group');
+const registerRulesCommands    = require('./modules/rules');
+const registerToggleCommands   = require('./modules/toggles');
+const registerBanwordCommands  = require('./modules/banwords');
+const registerStatusCommands   = require('./modules/status');
+const registerHelpCommand      = require('./modules/help');
 
 function startTelegram(token, adminId) {
   if (!token || !adminId) return null;
@@ -47,7 +46,6 @@ function startTelegram(token, adminId) {
   registerRulesCommands(ctx);
   registerToggleCommands(ctx);
   registerBanwordCommands(ctx);
-  registerWarnsCommands(ctx);
   registerStatusCommands(ctx);
 
   bot.on('polling_error', (err) => {
