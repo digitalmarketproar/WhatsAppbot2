@@ -18,8 +18,9 @@ const GroupSettingsSchema = new mongoose.Schema({
   // ضبط التحذيرات
   maxWarnings:      { type: Number, default: 3 },
 
-  // استثناء المشرفين (افتراضيًا معطل)
-  exemptAdmins:     { type: Boolean, default: false },
+  // استثناء المشرفين — مفعّل افتراضيًا (لن تُحذف/تُحظر رسائل المشرفين)
+  // يمكن لاحقًا إضافة أمر لتبديله إن لزم.
+  exemptAdmins:     { type: Boolean, default: true },
 }, {
   timestamps: true,
   versionKey: false,
