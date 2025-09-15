@@ -1,11 +1,11 @@
 // src/handlers/messages/moderation.js
-// موديريشن القروبات (نسخة تعرض الاسم فقط + Reply على رسالة المخالفة):
-// - يزيد عدّاد التحذيرات دائمًا عند المخالفة.
-// - يحذف رسالة المخالفة إن أمكن.
-// - يرسل تحذيرًا *بالاسم الظاهر فقط* ويرد على رسالة المخالفة (quoted: m).
-// - عند بلوغ الحد: يحاول الحظر باستخدام JID الفعلي من participants (قد يكون @lid) + رسالة فيها الاسم فقط والرد على المخالفة.
+// موديريشن القروبات (منشن بالاسم + Reply على رسالة المخالفة):
+// - التحذير والحظر يعرضان @الاسم (بدون رقم).
+// - نمرّر mentions:[jid] للحفاظ على المنشن الفعلي.
+// - التحذير: نرسل الرد أولًا ثم نحذف الرسالة.
+// - الحظر: نطرد أولًا ثم نرسل إعلان الحظر مع Reply.
 // - استثناء المشرفين (اختياري) عبر GroupSettings.exemptAdmins.
-// - لوج واضح لتشخيص المشاكل.
+// - استخدام JID الفعلي من participants (قد يكون @lid) عند الطرد.
 
 const GroupSettings = require('../../models/GroupSettings');
 const UserWarning   = require('../../models/UserWarning');
@@ -29,7 +29,6 @@ function textFromMessage(msg) {
 
 async function safeSend(sock, jid, content, extra = {}) {
   try {
-    // content قد يكون نصًا أو كائن رسالة (نص فقط هنا)
     const payload = typeof content === 'string' ? { text: content } : content;
     await sock.sendMessage(jid, payload, extra);
   } catch (e) {
@@ -196,25 +195,20 @@ async function moderateGroupMessage(sock, m) {
     logger.warn({ e, groupId, user: fromUserJid }, 'warn counter inc failed');
   }
 
-  // نحذف رسالة المخالفة (إن أمكن)
-  await deleteOffendingMessage(sock, m);
-
-  // اجلب الاسم الظاهر للعضو من القروب (لعرضه فقط)
+  // اجلب الاسم الظاهر للعضو من القروب (لعرضه في النص)
   const displayName = await getDisplayNameInGroup(sock, groupId, fromUserJid);
 
-  // أرسل التحذير أو نفّذ الحظر (مع الرد على رسالة المخالفة دائمًا)
   if (newCount >= maxWarnings) {
+    // 🟥 الحظر: طرد ثم إعلان بالحظر @الاسم + Reply
     try {
-      // استخدم JID الفعلي في participants (قد يكون @lid) للطرد
       const participantJid = await resolveParticipantJid(sock, groupId, fromUserJid);
       await sock.groupParticipantsUpdate(groupId, [participantJid], 'remove');
 
-      // نظّف السجل ثم أعلن الحظر بالاسم فقط + رد على المخالفة
       await UserWarning.deleteOne({ groupId, userId: fromUserJid }).catch(() => {});
       await safeSend(
         sock,
         groupId,
-        { text: `🚫 تم حظر *${displayName}* بعد ${maxWarnings} مخالفات.` },
+        { text: `🚫 تم حظر @${displayName} بعد ${maxWarnings} مخالفات.`, mentions: [fromUserJid] },
         { quoted: m }
       );
       logger.info({ groupId, user: fromUserJid, participantJid }, 'kick success');
@@ -228,13 +222,14 @@ async function moderateGroupMessage(sock, m) {
       }
     }
   } else {
-    // تحذير بالاسم فقط + رد على المخالفة
+    // 🟨 التحذير: نرسل التحذير أولًا @الاسم + Reply، ثم نحذف الرسالة
     await safeSend(
       sock,
       groupId,
-      { text: `⚠️ المخالفة ${newCount}/${maxWarnings}: *${displayName}*، الرجاء الالتزام بالقوانين.` },
+      { text: `⚠️ المخالفة ${newCount}/${maxWarnings}: @${displayName}، الرجاء الالتزام بالقوانين.`, mentions: [fromUserJid] },
       { quoted: m }
     );
+    await deleteOffendingMessage(sock, m);
     logger.info({ groupId, user: fromUserJid, count: newCount }, 'warning message sent');
   }
 
