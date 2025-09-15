@@ -13,11 +13,8 @@ const remind403 = new Map(); // groupId -> lastTs
 
 /** إرسال آمن */
 async function safeSend(sock, jid, content, extra = {}) {
-  try {
-    await sock.sendMessage(jid, content, extra);
-  } catch (e) {
-    logger.warn({ e, jid, content }, 'safeSend failed');
-  }
+  try { await sock.sendMessage(jid, content, extra); }
+  catch (e) { logger.warn({ e, jid, content }, 'safeSend failed'); }
 }
 
 /** استخراج نص الرسالة الخام */
@@ -71,9 +68,7 @@ function getDisplayNameFast(sock, jid) {
     const c = sock?.contacts?.[jid] || null;
     const name = c?.name || c?.verifiedName || c?.notify || null;
     return name && String(name).trim() ? String(name).trim() : null;
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
 
 /** إبني سطر منشن مضبوط: دائمًا @الرقم، وإن وُجد اسم بشري أضِفه */
@@ -125,7 +120,7 @@ async function moderateGroupMessage(sock, m) {
   const senderBare  = bareNumber(fromUserJid);
   const realParticipantJid = await resolveParticipantJid(sock, groupId, fromUserJid);
 
-  // ✅ استثناء بالقائمة البيضاء فقط
+  // ✅ استثناء بالقائمة البيضاء فقط (Early Return)
   if (inWhitelist(settings, realParticipantJid)) {
     logger.debug?.({ groupId, user: realParticipantJid }, 'skip moderation: whitelist exempt');
     return false;
@@ -164,8 +159,6 @@ async function moderateGroupMessage(sock, m) {
   // بناء المنشن: @الرقم (دائمًا) + اسم إن توفر
   const displayFast = getDisplayNameFast(sock, realParticipantJid);
   const mentionText = buildMentionLine(displayFast, senderBare);
-
-  // mentions بالـJID الحقيقي
   const mentionsArr = [realParticipantJid];
 
   // احذف المخالفة أولًا (إن أمكن)
