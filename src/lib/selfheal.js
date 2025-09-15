@@ -1,15 +1,15 @@
 // src/lib/selfheal.js
-// Self-heal مُحسّن لأخطاء التشفير (Bad MAC / No matching sessions)
-// - يرسل Retry Request رسمي للرسالة الفاشلة
-// - يحتسب فشل متتالي لكل JID (participant أو group)
-// - عند فشل ≥2: ينظّف session + sender-keys لذلك الـJID فقط (بدون لمس app-state-sync-key)
+// Self-Heal مُحسّن لأخطاء التشفير في Baileys/libsignal:
+// - Bad MAC
+// - No session found
+// - Invalid PreKey ID
+// آلية: Retry → عدّاد فشل لكل JID → Purge انتقائي (session/sender-keys) → Resync خفيف
 
 const mongoose = require('mongoose');
 const logger = require('./logger');
 
 const KEY_COLL_NAME = process.env.BAILEYS_KEY_COLLECTION || 'BaileysKey';
-// عدّاد فشل متتالي لكل مفتاح (participant أو group)
-const consecutiveFails = new Map();
+const consecutiveFails = new Map(); // مفتاحه participant أو groupJid
 
 function escapeReg(s) {
   return String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -19,32 +19,25 @@ function escapeReg(s) {
 async function purgeSessionForJid(jid) {
   try {
     const sJid = String(jid || '');
-    if (!sJid || sJid === 'status@broadcast') {
-      logger.debug?.({ jid: sJid }, 'skip purge session for invalid/status jid');
-      return;
-    }
+    if (!sJid || sJid === 'status@broadcast') return;
 
-    // استهدف صيغ @lid و @s.whatsapp.net وأيضًا "النواة" قبل @
     const at = sJid.indexOf('@');
     const core = at === -1 ? sJid : sJid.slice(0, at);
     const col  = mongoose.connection.collection(KEY_COLL_NAME);
 
-    // Baileys يخزن مفاتيح session بصيغ متنوعة:
-    // - { _id: "session:<jid>" } أو { id: "session:<jid>" }
-    // - أحيانًا type/collection schema تختلف؛ لذا نستخدم regex على id/_id.
     const patterns = [
       `^session:${escapeReg(sJid)}$`,
-      `^session:${escapeReg(core)}(@.+)?$`, // تحوط
+      `^session:${escapeReg(core)}(@.+)?$`,
     ];
 
-    const orConds = [
-      { id:  { $regex: patterns[0] } },
-      { _id: { $regex: patterns[0] } },
-      { id:  { $regex: patterns[1] } },
-      { _id: { $regex: patterns[1] } },
-    ];
-
-    const res = await col.deleteMany({ $or: orConds });
+    const res = await col.deleteMany({
+      $or: [
+        { id:  { $regex: patterns[0] } },
+        { _id: { $regex: patterns[0] } },
+        { id:  { $regex: patterns[1] } },
+        { _id: { $regex: patterns[1] } },
+      ],
+    });
     logger.warn({ jid: sJid, deleted: res?.deletedCount }, 'purged session keys for jid');
   } catch (e) {
     logger.warn({ e, jid }, 'purgeSessionForJid failed');
@@ -58,9 +51,7 @@ async function purgeSenderKeysFor(groupJid, participantJid) {
     const p = String(participantJid || '');
     const col = mongoose.connection.collection(KEY_COLL_NAME);
 
-    // صيغة sender-key في بايليس غالبًا:
-    // id: "sender-key-<groupJid>::<deviceJid>::<iteration>"
-    // نستهدف group + participant معًا لو توفر participant، وإلا المجموعة فقط.
+    // صيغ مُحتملة: sender-key-<groupJid>::<deviceJid>::<iter>
     const groupPat = `^sender-key-${escapeReg(g)}(::|:)`;
     const orConds = p
       ? [
@@ -89,14 +80,13 @@ async function requestRetry(sock, key) {
   }
 }
 
-// مفتاح العدّاد: نفضّل participant إن وجد، وإلا group/chat
 function counterKeyFrom(mOrU) {
   const k = mOrU?.key || mOrU || {};
   return k.participant || k.remoteJid || 'unknown';
 }
 
 function registerSelfHeal(sock, { messageStore } = {}) {
-  // تأمين getMessage لدعم إعادة الإرسال
+  // تأمين getMessage لدعم retry
   if (typeof sock.getMessage !== 'function') {
     sock.getMessage = async (key) => {
       const id = key?.id;
@@ -104,18 +94,16 @@ function registerSelfHeal(sock, { messageStore } = {}) {
     };
   }
 
-  // رسائل جديدة: خزن الرسالة واصفر العدّاد
+  // خزن الرسائل الجديدة واصفر العدّاد
   sock.ev.on('messages.upsert', async ({ messages }) => {
     if (!Array.isArray(messages)) return;
     for (const m of messages) {
       try {
         const chatId = m?.key?.remoteJid;
         if (chatId === 'status@broadcast') continue;
-
         if (m?.key?.id && messageStore) {
           messageStore.set(m.key.id, m);
-          const ck = counterKeyFrom(m);
-          consecutiveFails.delete(ck);
+          consecutiveFails.delete(counterKeyFrom(m));
         }
       } catch (e) {
         logger.warn({ e, m }, 'selfheal upsert handler failed');
@@ -123,7 +111,7 @@ function registerSelfHeal(sock, { messageStore } = {}) {
     }
   });
 
-  // تحديثات الرسائل (محل ظهور أخطاء Bad MAC/No session)
+  // معالجة أخطاء فك التشفير
   sock.ev.on('messages.update', async (updates) => {
     for (const u of updates || []) {
       try {
@@ -131,7 +119,6 @@ function registerSelfHeal(sock, { messageStore } = {}) {
         const chatId = key?.remoteJid || '';
         if (chatId === 'status@broadcast') continue;
 
-        // اجمع كل الأخطاء في نص واحد
         const errs = []
           .concat(u?.errors || [])
           .concat(u?.error ? [u.error] : [])
@@ -141,38 +128,35 @@ function registerSelfHeal(sock, { messageStore } = {}) {
 
         const badMac = /bad\s*mac/.test(errs);
         const noSess = /no (matching )?sessions? found/.test(errs) || /no session found/.test(errs);
+        const invalidPreKey = /invalid\s*prekey\s*id/.test(errs);
 
-        if (badMac || noSess) {
-          const ck = counterKeyFrom(u);
-          // اطلب إعادة الإرسال أولًا
+        if (badMac || noSess || invalidPreKey) {
+          // 1) اطلب إعادة الإرسال
           await requestRetry(sock, key);
 
-          // زد العدّاد
+          // 2) عدّاد فشل
+          const ck = counterKeyFrom(u);
           const fails = (consecutiveFails.get(ck) || 0) + 1;
           consecutiveFails.set(ck, fails);
 
-          // بعد محاولتين: نظّف ثم صفّر العدّاد
+          // 3) بعد محاولتين فاشلتين: نظّف
           if (fails >= 2) {
             const participant = key?.participant || '';
-            // نظّف session للطرف المسبب + sender-keys في الغروب
             await purgeSessionForJid(participant || chatId);
             await purgeSenderKeysFor(chatId, participant);
 
-            // resync خفيف
             try {
               await sock.resyncAppState?.(['critical_unblock_low', 'regular_high']);
             } catch (e) {
               logger.warn({ e }, 'resync after purge failed');
             }
-
             consecutiveFails.delete(ck);
           }
 
-          logger.warn({ key, fails: consecutiveFails.get(ck), badMac, noSess }, 'selfheal: decryption error handled');
+          logger.warn({ key, fails: consecutiveFails.get(ck), badMac, noSess, invalidPreKey }, 'selfheal: decryption error handled');
         } else if (u?.message) {
-          // نجاح الاستلام/فك التشفير: صفّر
-          const ck = counterKeyFrom(u);
-          consecutiveFails.delete(ck);
+          // نجاح فك التشفير
+          consecutiveFails.delete(counterKeyFrom(u));
         }
       } catch (e) {
         logger.warn({ e, u }, 'selfheal messages.update handler failed');
