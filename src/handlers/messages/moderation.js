@@ -119,10 +119,10 @@ async function moderateGroupMessage(sock, m) {
 
   const fromUserJid        = normalizeUserJid(senderRaw);
   const realParticipantJid = await resolveParticipantJid(sock, groupId, fromUserJid);
-  const participantPn      = m?.key?.participantPn || null;
+  const participantPn      = m?.key?.participantPn || null; // ندعم PN كذلك
   const senderBare         = toBareNum(fromUserJid);
 
-  // ✅ استثناء مبكّر بالقائمة البيضاء (يدعم تعدد المرشحين: realJid, rawJid, participantPn)
+  // ✅ استثناء مبكّر بالقائمة البيضاء (يدعم realJid, rawJid, participantPn)
   if (inWhitelist(settings, [realParticipantJid, fromUserJid, participantPn])) {
     logger.debug?.({
       groupId, user: realParticipantJid,
