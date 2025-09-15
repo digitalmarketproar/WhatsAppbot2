@@ -1,3 +1,4 @@
+// src/app/telegram/modules/help.js
 const { adminOnly } = require('../util');
 
 function helpText() {
@@ -50,6 +51,16 @@ function helpText() {
     '',
     '/g_banword_list 1203...@g.us',
     'عرض قائمة الكلمات المحظورة.',
+    '',
+    // ⬇️ القسم الجديد: القائمة البيضاء
+    '/g_wl_add 1203...@g.us 9677XXXXXXXX',
+    'إضافة رقم (bare) إلى القائمة البيضاء — يُستثنى من الموديريشن.',
+    '',
+    '/g_wl_del 1203...@g.us 9677XXXXXXXX',
+    'حذف رقم من القائمة البيضاء.',
+    '',
+    '/g_wl_list 1203...@g.us',
+    'استعراض قائمة الأرقام في القائمة البيضاء.',
     '',
     '/g_status 1203...@g.us',
     'ملخص حالة القروب (إعدادات مختصرة).'
