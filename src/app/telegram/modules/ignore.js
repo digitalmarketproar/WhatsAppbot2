@@ -2,6 +2,10 @@
 const IgnoreChat = require('../../../models/IgnoreChat');
 const { normalizeToJid, adminOnly } = require('../util');
 
+function uniq(arr) {
+  return Array.from(new Set(arr.filter(Boolean)));
+}
+
 module.exports = function registerIgnoreCommands(ctx) {
   ctx.bot.on('text', adminOnly(ctx, async (msg) => {
     const parts = (msg.text || '').trim().split(/\s+/);
@@ -15,8 +19,10 @@ module.exports = function registerIgnoreCommands(ctx) {
       }
       const bare = jid.replace(/@.+$/, '');
 
-      // تحقق إذا موجود مسبقًا
-      const exists = await IgnoreChat.findOne({ $or: [{ chatId: jid }, { bare: bare }] }).lean();
+      // إن كان موجودًا مسبقًا لا نكرر
+      const exists = await IgnoreChat.findOne({
+        $or: [{ chatId: jid }, { chatId: bare }, { bare: bare }]
+      }).lean();
       if (exists) {
         return ctx.bot.sendMessage(ctx.adminId, `⚠️ الرقم ${bare} موجود مسبقًا في قائمة التجاهل.`);
       }
@@ -32,9 +38,17 @@ module.exports = function registerIgnoreCommands(ctx) {
         return ctx.bot.sendMessage(ctx.adminId, 'استخدم: /allow 9677XXXXXXXX');
       }
       const bare = jid.replace(/@.+$/, '');
+
+      // نحاول حذف كل الصيغ المحتملة التي ربما سُجّلت سابقًا
+      const candidates = uniq([jid, bare, `${bare}@s.whatsapp.net`]);
+
       const res = await IgnoreChat.deleteMany({
-        $or: [{ chatId: jid }, { chatId: bare }, { bare: bare }]
+        $or: [
+          { chatId: { $in: candidates } },
+          { bare:   { $in: [bare] } }
+        ]
       });
+
       if (res.deletedCount > 0) {
         return ctx.bot.sendMessage(ctx.adminId, `✅ تمت الإزالة من التجاهل: ${jid} (حُذف ${res.deletedCount})`);
       } else {
@@ -46,7 +60,7 @@ module.exports = function registerIgnoreCommands(ctx) {
     if (cmd === '/ignores') {
       const list = await IgnoreChat.find({}).sort({ createdAt: -1 }).lean();
       const lines =
-        list.map((x, i) => `${i + 1}. ${x.chatId}${x.bare ? ` (bare:${x.bare})` : ''}`).join('\n') ||
+        (list || []).map((x, i) => `${i + 1}. ${x.chatId}${x.bare ? ` (bare:${x.bare})` : ''}`).join('\n') ||
         '— (قائمة فارغة)';
       return ctx.bot.sendMessage(ctx.adminId, `قائمة التجاهل:\n${lines}`, {
         disable_web_page_preview: true,
