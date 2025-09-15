@@ -1,11 +1,10 @@
 // src/handlers/messages/moderation.js
-// موديريشن القروبات (منشن بالاسم + Reply على رسالة المخالفة):
-// - التحذير والحظر يعرضان @الاسم (بدون رقم).
-// - نمرّر mentions:[jid] للحفاظ على المنشن الفعلي.
-// - التحذير: نرسل الرد أولًا ثم نحذف الرسالة.
-// - الحظر: نطرد أولًا ثم نرسل إعلان الحظر مع Reply.
-// - استثناء المشرفين (اختياري) عبر GroupSettings.exemptAdmins.
-// - استخدام JID الفعلي من participants (قد يكون @lid) عند الطرد.
+// موديريشن القروبات (حذف أولًا ثم رد، ومنشن بالاسم فقط):
+// - يزيد عدّاد التحذيرات عند المخالفة.
+// - يحذف رسالة المخالفة أولًا (سريع كما طلبت).
+// - يرسل تحذيرًا/حظرًا يعرض @الاسم فقط، ويرد على الرسالة (حتى لو صارت محذوفة).
+// - يستخدم JID الفعلي للمشارك (قد يكون @lid) للطرد.
+// - يدعم استثناء المشرفين (GroupSettings.exemptAdmins).
 
 const GroupSettings = require('../../models/GroupSettings');
 const UserWarning   = require('../../models/UserWarning');
@@ -110,7 +109,7 @@ async function getDisplayNameInGroup(sock, groupId, anyUserJid) {
   } catch {}
   try {
     const md = await sock.groupMetadata(groupId);
-    const p = (md?.participants || []).find(x => bareNumber(normalizeUserJid(x.id)) === targetBare);
+    const p = (md?.participants || []).find x => bareNumber(normalizeUserJid(x.id)) === targetBare);
     const name = p?.notify || p?.name || p?.verifiedName;
     if (name && String(name).trim()) return String(name).trim();
   } catch {}
@@ -195,8 +194,12 @@ async function moderateGroupMessage(sock, m) {
     logger.warn({ e, groupId, user: fromUserJid }, 'warn counter inc failed');
   }
 
-  // اجلب الاسم الظاهر للعضو من القروب (لعرضه في النص)
+  // جهّز الاسم للعرض
   const displayName = await getDisplayNameInGroup(sock, groupId, fromUserJid);
+  const mentionJid  = fromUserJid; // نمرّره في mentions لدعم الإشارة إن أمكن
+
+  // 🗑️ احذف أولًا (كما رغبت) ثم أرسل التحذير/الحظر
+  await deleteOffendingMessage(sock, m);
 
   if (newCount >= maxWarnings) {
     // 🟥 الحظر: طرد ثم إعلان بالحظر @الاسم + Reply
@@ -208,7 +211,7 @@ async function moderateGroupMessage(sock, m) {
       await safeSend(
         sock,
         groupId,
-        { text: `🚫 تم حظر @${displayName} بعد ${maxWarnings} مخالفات.`, mentions: [fromUserJid] },
+        { text: `🚫 تم حظر @${displayName} بعد ${maxWarnings} مخالفات.`, mentions: [mentionJid] },
         { quoted: m }
       );
       logger.info({ groupId, user: fromUserJid, participantJid }, 'kick success');
@@ -222,14 +225,13 @@ async function moderateGroupMessage(sock, m) {
       }
     }
   } else {
-    // 🟨 التحذير: نرسل التحذير أولًا @الاسم + Reply، ثم نحذف الرسالة
+    // 🟨 التحذير: @الاسم + Reply (بعد الحذف)
     await safeSend(
       sock,
       groupId,
-      { text: `⚠️ المخالفة ${newCount}/${maxWarnings}: @${displayName}، الرجاء الالتزام بالقوانين.`, mentions: [fromUserJid] },
+      { text: `⚠️ المخالفة ${newCount}/${maxWarnings}: @${displayName}، الرجاء الالتزام بالقوانين.`, mentions: [mentionJid] },
       { quoted: m }
     );
-    await deleteOffendingMessage(sock, m);
     logger.info({ groupId, user: fromUserJid, count: newCount }, 'warning message sent');
   }
 
