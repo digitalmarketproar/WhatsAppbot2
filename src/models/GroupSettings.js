@@ -1,26 +1,28 @@
+// src/models/GroupSettings.js
 const mongoose = require('mongoose');
 
-const GroupSettingsSchema = new mongoose.Schema(
-  {
-    groupId: { type: String, required: true, unique: true, index: true }, // 1203...@g.us
-    enabled: { type: Boolean, default: false },
+const GroupSettingsSchema = new mongoose.Schema({
+  groupId:          { type: String, index: true, required: true, unique: true },
+  enabled:          { type: Boolean, default: true },
 
-    // قوانين (نص حر/Markdown بسيط)
-    rules: { type: String, default: '' },
-    welcomeEnabled: { type: Boolean, default: true },
-    farewellEnabled: { type: Boolean, default: true },
+  // ترحيب/وداع
+  welcomeEnabled:   { type: Boolean, default: true },
+  farewellEnabled:  { type: Boolean, default: true },
+  rules:            { type: String, default: '' },
 
-    // سياسات المنع
-    blockMedia: { type: Boolean, default: true },
-    blockLinks: { type: Boolean, default: true },
+  // فلاتر
+  blockLinks:       { type: Boolean, default: false },
+  blockMedia:       { type: Boolean, default: false },
+  bannedWords:      { type: [String], default: [] },
 
-    // كلمات محظورة (نخزّنها غير مطبّعة، ونطبّع وقت المطابقة)
-    bannedWords: { type: [String], default: [] },
+  // ضبط التحذيرات
+  maxWarnings:      { type: Number, default: 3 },
 
-    // التحذيرات
-    maxWarnings: { type: Number, default: 3 }
-  },
-  { timestamps: true, versionKey: false }
-);
+  // استثناء المشرفين (افتراضيًا معطل)
+  exemptAdmins:     { type: Boolean, default: false },
+}, {
+  timestamps: true,
+  versionKey: false,
+});
 
-module.exports = mongoose.models.GroupSettings || mongoose.model('GroupSettings', GroupSettingsSchema);
+module.exports = mongoose.model('GroupSettings', GroupSettingsSchema);
