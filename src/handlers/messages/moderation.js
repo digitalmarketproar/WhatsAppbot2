@@ -1,6 +1,5 @@
 // src/handlers/messages/moderation.js
-// موديريشن القروبات باعتماد استثناء "القائمة البيضاء" فقط (بدون أي تمييز للمشرفين).
-// يعتمد على: GroupSettings, UserWarning, logger, arabic.js, jid.js
+// موديريشن القروبات باعتماد استثناء "القائمة البيضاء" فقط.
 
 const GroupSettings = require('../../models/GroupSettings');
 const UserWarning   = require('../../models/UserWarning');
@@ -8,16 +7,13 @@ const { normalizeArabic, hasLink, isMediaMessage } = require('../../lib/arabic')
 const { normalizeUserJid, bareNumber } = require('../../lib/jid');
 const logger = require('../../lib/logger');
 
-// تنبيه نقص الصلاحيات (لتخفيف الإزعاج)
 const remind403 = new Map(); // groupId -> lastTs
 
-/** إرسال آمن */
 async function safeSend(sock, jid, content, extra = {}) {
   try { await sock.sendMessage(jid, content, extra); }
   catch (e) { logger.warn({ e, jid, content }, 'safeSend failed'); }
 }
 
-/** استخراج نص الرسالة الخام */
 function textFromMessage(m = {}) {
   const msg = m.message || {};
   if (typeof msg.conversation === 'string') return msg.conversation;
@@ -32,7 +28,6 @@ function textFromMessage(m = {}) {
   return '';
 }
 
-/** حذف الرسالة المخالفة */
 async function deleteOffendingMessage(sock, m, realParticipantJid) {
   const groupId = m.key.remoteJid;
   try {
@@ -62,7 +57,6 @@ async function deleteOffendingMessage(sock, m, realParticipantJid) {
   }
 }
 
-/** جلب اسم سريع من كاش الاتصالات؛ وإلا نعيد null (المنشن يتكفّل بالرقم) */
 function getDisplayNameFast(sock, jid) {
   try {
     const c = sock?.contacts?.[jid] || null;
@@ -71,7 +65,6 @@ function getDisplayNameFast(sock, jid) {
   } catch { return null; }
 }
 
-/** إبني سطر منشن مضبوط: دائمًا @الرقم، وإن وُجد اسم بشري أضِفه */
 function buildMentionLine(displayName, bareNum) {
   const clean = String(bareNum).replace(/\D/g, '');
   const looksNumeric = /^\+?\d[\d\s]*$/.test(displayName || '');
@@ -79,7 +72,6 @@ function buildMentionLine(displayName, bareNum) {
   return `@${clean} — *${displayName}*`;
 }
 
-/** إيجاد JID الحقيقي كما يراه واتساب (قد يكون @lid) */
 async function resolveParticipantJid(sock, groupId, anyUserJid) {
   const targetBare = bareNumber(normalizeUserJid(anyUserJid));
   try {
@@ -95,16 +87,13 @@ async function resolveParticipantJid(sock, groupId, anyUserJid) {
   return normalizeUserJid(anyUserJid);
 }
 
-/** حوّل أي قيمة إلى bare number منقّى من أي رموز */
 function toBareNum(v) {
   if (!v) return '';
-  // يدعم إدخال jid (xxx@domain) أو رقم صِرف أو participantPn
   const s = String(v);
   const beforeAt = s.includes('@') ? s.split('@')[0] : s;
   return beforeAt.replace(/\D/g, '');
 }
 
-/** فحص القائمة البيضاء: يطابق ضد عدة مرشّحين للمرسل للتغلب على فروقات LID/MD */
 function inWhitelist(settings, candidates = []) {
   const list = Array.isArray(settings?.whitelistNumbers) ? settings.whitelistNumbers.map(toBareNum) : [];
   if (!list.length) return false;
@@ -115,7 +104,6 @@ function inWhitelist(settings, candidates = []) {
   return false;
 }
 
-/** المعالجة الأساسية للرسائل في القروبات */
 async function moderateGroupMessage(sock, m) {
   const groupId = m?.key?.remoteJid;
   if (!groupId?.endsWith('@g.us')) return false;
@@ -129,16 +117,13 @@ async function moderateGroupMessage(sock, m) {
     return false;
   }
 
-  // جهّز كل صيغ الهوية الممكنة للمرسل
-  const fromUserJid       = normalizeUserJid(senderRaw);                 // قد يكون lid ← s.whatsapp
-  const realParticipantJid= await resolveParticipantJid(sock, groupId, fromUserJid); // JID الفعلي في القروب
-  const participantPn     = m?.key?.participantPn || null;               // إن وُجد (من لوجك)
-  const senderBare        = toBareNum(fromUserJid);
+  const fromUserJid        = normalizeUserJid(senderRaw);
+  const realParticipantJid = await resolveParticipantJid(sock, groupId, fromUserJid);
+  const participantPn      = m?.key?.participantPn || null;
+  const senderBare         = toBareNum(fromUserJid);
 
-  // ✅ استثناء بالقائمة البيضاء فقط (Early Return) مع تعدد المرشّحين
-  // يشمل: JID الفعلي، JID الخام، participantPn (إن وُجد)
-  const wlHit = inWhitelist(settings, [realParticipantJid, fromUserJid, participantPn]);
-  if (wlHit) {
+  // ✅ استثناء مبكّر بالقائمة البيضاء (يدعم تعدد المرشحين: realJid, rawJid, participantPn)
+  if (inWhitelist(settings, [realParticipantJid, fromUserJid, participantPn])) {
     logger.debug?.({
       groupId, user: realParticipantJid,
       candidates: { realParticipantJid, fromUserJid, participantPn },
@@ -147,10 +132,8 @@ async function moderateGroupMessage(sock, m) {
     return false;
   }
 
-  // إعدادات
   const maxWarnings = Math.max(1, Number(settings.maxWarnings || 3));
 
-  // كشف المخالفة
   const raw  = textFromMessage(m);
   const norm = normalizeArabic(raw);
 
@@ -163,7 +146,6 @@ async function moderateGroupMessage(sock, m) {
   }
   if (!violated) return false;
 
-  // عدّاد التحذيرات
   let newCount = 1;
   try {
     const doc = await UserWarning.findOneAndUpdate(
@@ -177,22 +159,18 @@ async function moderateGroupMessage(sock, m) {
     logger.warn({ e, groupId, user: realParticipantJid }, 'warn counter inc failed');
   }
 
-  // بناء المنشن: @الرقم (دائمًا) + اسم إن توفر
   const displayFast = getDisplayNameFast(sock, realParticipantJid);
   const mentionText = buildMentionLine(displayFast, senderBare);
   const mentionsArr = [realParticipantJid];
 
-  // احذف المخالفة أولًا (إن أمكن)
   await deleteOffendingMessage(sock, m, realParticipantJid);
 
   if (newCount >= maxWarnings) {
-    // حظر
     try {
       await sock.groupParticipantsUpdate(groupId, [realParticipantJid], 'remove');
       await UserWarning.deleteOne({ groupId, userId: realParticipantJid }).catch(() => {});
       await safeSend(
-        sock,
-        groupId,
+        sock, groupId,
         { text: `🚫 تم حظر ${mentionText} بعد ${maxWarnings} مخالفات.`, mentions: mentionsArr },
         { quoted: m }
       );
@@ -207,10 +185,8 @@ async function moderateGroupMessage(sock, m) {
       }
     }
   } else {
-    // تحذير
     await safeSend(
-      sock,
-      groupId,
+      sock, groupId,
       { text: `⚠️ المخالفة ${newCount}/${maxWarnings}: ${mentionText}، الرجاء الالتزام بالقوانين.`, mentions: mentionsArr },
       { quoted: m }
     );
