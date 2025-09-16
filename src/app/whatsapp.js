@@ -135,7 +135,7 @@ async function createWhatsApp({ telegram } = {}) {
 
   sock.ev.on('creds.update', saveCreds);
 
-  // مراقبة الاتصال + التبليغ عن وجود QR
+  // مراقبة الاتصال + إرسال QR إلى تيليجرام
   sock.ev.on('connection.update', async (u) => {
     const { connection, lastDisconnect, qr } = u || {};
     logger.info(
@@ -143,14 +143,20 @@ async function createWhatsApp({ telegram } = {}) {
       'WA connection.update'
     );
 
-    // إن رغبت بإرسال QR إلى تيليجرام:
-    // if (qr && telegram) {
-    //   try {
-    //     await telegram.sendMessage(process.env.TG_CHAT_ID, 'Scan this WhatsApp QR:\n' + qr);
-    //   } catch (e) {
-    //     logger.warn({ e }, 'Failed to send QR to Telegram');
-    //   }
-    // }
+    // ⬅️ إرسال الـ QR إلى تيليجرام فور توليده
+    if (qr && telegram) {
+      try {
+        if (typeof telegram.sendQR === 'function') {
+          // دالة جاهزة في مشروعك ترسم QR كصورة وترسله للـ admin
+          await telegram.sendQR(qr);
+        } else if (typeof telegram.sendMessage === 'function') {
+          // بديل نصّي إن لم تتوفر sendQR
+          await telegram.sendMessage(process.env.TG_CHAT_ID, 'Scan this WhatsApp QR:\n' + qr);
+        }
+      } catch (e) {
+        logger.warn({ e }, 'Failed to send QR to Telegram');
+      }
+    }
   });
 
   // تخزين الرسائل
