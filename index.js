@@ -1,6 +1,6 @@
-// index.js (تأكد أنه هكذا)
+// index.js
 const { startExpress } = require('./src/app/express');
-const { createWhatsApp } = require('./src/app/whatsapp');
+const { startWhatsApp } = require('./src/app/whatsapp');   // ⬅️ بدّل createWhatsApp بـ startWhatsApp
 const { onMessageUpsert } = require('./src/handlers/messages');
 const { registerGroupParticipantHandler } = require('./src/handlers/groups');
 const { connectMongo } = require('./src/lib/db');
@@ -10,10 +10,16 @@ const logger = require('./src/lib/logger');
 
 (async () => {
   startExpress();
-  await connectMongo(MONGODB_URI).catch(e => logger.warn('Mongo not connected: ' + e.message));
-  const telegram = startTelegram(TELEGRAM_TOKEN, TELEGRAM_ADMIN_ID);
-  const sock = await createWhatsApp({ telegram });
+  await connectMongo(MONGODB_URI).catch(e =>
+    logger.warn('Mongo not connected: ' + e.message)
+  );
 
+  const telegram = startTelegram(TELEGRAM_TOKEN, TELEGRAM_ADMIN_ID);
+
+  // ⬅️ استعمل startWhatsApp بدل createWhatsApp
+  const sock = await startWhatsApp({ telegram });
+
+  // handlers
   sock.ev.on('messages.upsert', onMessageUpsert(sock));
   registerGroupParticipantHandler(sock);
 
