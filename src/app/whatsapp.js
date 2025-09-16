@@ -99,7 +99,7 @@ async function createWhatsApp({ telegram } = {}) {
     }
   });
 
-  // التعافي الذاتي (ينظّف sessions/sender-keys عند الفشل المتكرر)
+  // التعافي الذاتي (ينظّف sessions/sender-keys عند الفشل المتكرر) — بإعدادات جديدة آمنة
   registerSelfHeal(sock, { messageStore });
 
   // تنظيف دوري للذاكرة المؤقتة (اختياري)
