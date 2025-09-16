@@ -9,7 +9,6 @@ const mongoose = require('mongoose');
 const fs = require('fs');
 const path = require('path');
 
-// ---------- مسح القاعدة/المجموعات عند الإقلاع (اختياري عبر البيئة) ----------
 const ONCE_FLAG = path.join('/tmp', 'wipe_baileys_done');
 
 function parseList(val) {
@@ -20,10 +19,9 @@ function parseList(val) {
 }
 
 async function maybeWipeDatabase() {
-  const mode = (process.env.WIPE_BAILEYS || '').toLowerCase().trim(); // '', '1', 'all', 'custom'
+  const mode = (process.env.WIPE_BAILEYS || '').toLowerCase().trim();
   if (!mode) return;
 
-  // منع التكرار إن تم تفعيل once
   if (String(process.env.WIPE_BAILEYS_ONCE || '') === '1' && fs.existsSync(ONCE_FLAG)) {
     logger.warn('WIPE_BAILEYS_ONCE=1: wipe already performed previously; skipping.');
     return;
@@ -48,15 +46,11 @@ async function maybeWipeDatabase() {
       await db.dropDatabase();
       logger.warn(`🗑️ Dropped entire Mongo database "${name}".`);
     } else if (mode === '1') {
-      // الوضع الآمن: امسح مجموعتي Baileys فقط
       const credsCol = db.collection(CREDS);
       const keysCol  = db.collection(KEYS);
       const r1 = await credsCol.deleteMany({});
       const r2 = await keysCol.deleteMany({});
-      logger.warn({
-        collections: [CREDS, KEYS],
-        deleted: { [CREDS]: r1?.deletedCount || 0, [KEYS]: r2?.deletedCount || 0 }
-      }, '✅ Wiped Baileys collections');
+      logger.warn({ collections: [CREDS, KEYS], deleted: { [CREDS]: r1?.deletedCount || 0, [KEYS]: r2?.deletedCount || 0 } }, '✅ Wiped Baileys collections');
     } else if (mode === 'custom') {
       const list = parseList(process.env.WIPE_BAILEYS_COLLECTIONS);
       if (!list.length) {
@@ -78,7 +72,6 @@ async function maybeWipeDatabase() {
       logger.warn({ mode }, 'Unknown WIPE_BAILEYS mode; skipping.');
     }
 
-    // علّم مرة واحدة إذا مفعّل
     if (String(process.env.WIPE_BAILEYS_ONCE || '') === '1') {
       try { fs.writeFileSync(ONCE_FLAG, String(Date.now())); } catch {}
     }
@@ -89,10 +82,9 @@ async function maybeWipeDatabase() {
   }
 }
 
-// ---------- مخزن بسيط للرسائل لدعم getMessage ----------
-const messageStore = new Map(); // key: message.key.id -> value: proto message
+// ====== رسالة/Store بسيط =========
+const messageStore = new Map();
 const MAX_STORE = Number(process.env.WA_MESSAGE_STORE_MAX || 5000);
-
 function storeMessage(msg) {
   if (!msg?.key?.id) return;
   if (messageStore.size >= MAX_STORE) {
@@ -102,8 +94,18 @@ function storeMessage(msg) {
   messageStore.set(msg.key.id, msg);
 }
 
-// ---------- *إنشاء* سوكِت واتساب ----------
-async function createWhatsApp({ telegram } = {}) {
+// ====== حارس سوكِت لمنع التوازي =========
+let currentSock = null;
+let reconnecting = false;
+let generation = 0;
+
+function safeCloseSock(sock) {
+  try { sock?.end?.(); } catch {}
+  try { sock?.ws?.close?.(); } catch {}
+}
+
+// ====== إنشاء سوكِت واحد =========
+async function createSingleSocket({ telegram } = {}) {
   const { state, saveCreds } = await mongoAuthState(logger);
   const { version } = await fetchLatestBaileysVersion();
 
@@ -116,35 +118,39 @@ async function createWhatsApp({ telegram } = {}) {
   const sock = makeWASocket({
     version,
     auth: state,
-    printQRInTerminal: !telegram, // لإظهار QR بالكونسول إن لم يكن Telegram مفعّلًا
+    printQRInTerminal: !telegram,
     logger,
     emitOwnEvents: false,
     syncFullHistory: false,
     shouldSyncHistoryMessage: () => false,
     markOnlineOnConnect: false,
-    getMessage: async (key) => {
-      if (!key?.id) return undefined;
-      return messageStore.get(key.id);
-    },
+    getMessage: async (key) => (key?.id ? messageStore.get(key.id) : undefined),
     msgRetryCounterCache,
     shouldIgnoreJid: (jid) => jid === 'status@broadcast',
   });
 
+  const myGen = ++generation;
+  logger.info({ gen: myGen }, 'WA socket created');
+
   sock.ev.on('creds.update', saveCreds);
 
-  // مراقبة الاتصال + إرسال QR إلى تيليجرام
   sock.ev.on('connection.update', async (u) => {
     const { connection, lastDisconnect, qr } = u || {};
+    const code =
+      lastDisconnect?.error?.output?.statusCode ??
+      lastDisconnect?.error?.statusCode ??
+      lastDisconnect?.statusCode;
+
     logger.info(
-      { connection, lastDisconnectReason: lastDisconnect?.error?.message, hasQR: Boolean(qr) },
+      { gen: myGen, connection, code, hasQR: Boolean(qr) },
       'WA connection.update'
     );
 
-    // ⬅️ إرسال الـ QR إلى تيليجرام فور توليده
+    // أرسل الـ QR إلى تيليجرام عند توفره
     if (qr && telegram) {
       try {
         if (typeof telegram.sendQR === 'function') {
-          await telegram.sendQR(qr); // صورة QR
+          await telegram.sendQR(qr);
         } else if (typeof telegram.sendMessage === 'function') {
           await telegram.sendMessage(process.env.TG_CHAT_ID, 'Scan this WhatsApp QR:\n' + qr);
         }
@@ -153,20 +159,30 @@ async function createWhatsApp({ telegram } = {}) {
       }
     }
 
-    // ⬅️ إعادة الاتصال تلقائيًا عند الإغلاق ما لم نكن "Logged Out"
+    // إعادة اتصال نظيفة — تمنع التوازي
     if (connection === 'close') {
-      const code =
-        lastDisconnect?.error?.output?.statusCode ??
-        lastDisconnect?.error?.statusCode ??
-        lastDisconnect?.statusCode;
-
       const shouldReconnect = code !== DisconnectReason.loggedOut;
       if (shouldReconnect) {
-        logger.warn({ code }, 'WA closed, restarting socket...');
-        // مهلة قصيرة لتفادي الازدواجية
-        setTimeout(() => {
-          startWhatsApp({ telegram }).catch(err => logger.error({ err }, 'restart failed'));
-        }, 2000);
+        if (!reconnecting) {
+          reconnecting = true;
+          logger.warn({ gen: myGen, code }, 'WA closed, scheduling clean restart...');
+          // أغلق السوكِت الحالي قبل إنشاء جديد
+          safeCloseSock(currentSock);
+          currentSock = null;
+
+          setTimeout(async () => {
+            try {
+              currentSock = await createSingleSocket({ telegram });
+              logger.info({ gen: generation }, 'WA restarted cleanly');
+            } catch (err) {
+              logger.error({ err }, 'WA restart failed');
+            } finally {
+              reconnecting = false;
+            }
+          }, 2000);
+        } else {
+          logger.warn({ gen: myGen }, 'Reconnect already in progress, skipping duplicate restart');
+        }
       } else {
         logger.error('WA logged out — wipe creds or rescan QR to login again.');
       }
@@ -182,7 +198,7 @@ async function createWhatsApp({ telegram } = {}) {
     }
   });
 
-  // resync خفيف عند إشارات retry/409/410
+  // resync خفيف عند retry/409/410
   sock.ev.on('messages.update', async (updates) => {
     for (const u of updates || []) {
       try {
@@ -213,25 +229,30 @@ async function createWhatsApp({ telegram } = {}) {
   return sock;
 }
 
-// ---------- *بدء* واتساب مع مسح اختياري + إعادة اتصال تلقائية ----------
-let starting = false;
+// ====== نقطة البدء العامة ======
+let wipedOnce = false;
 async function startWhatsApp({ telegram } = {}) {
-  if (starting) return;
-  starting = true;
-
-  try {
-    // نفّذ المسح الاختياري قبل أول تهيئة فقط
-    await maybeWipeDatabase();
-  } catch (e) {
-    logger.warn({ e }, 'maybeWipeDatabase error (continuing)');
+  // نفّذ المسح مرة واحدة فقط (لو مفعّل)
+  if (!wipedOnce) {
+    try { await maybeWipeDatabase(); } catch (e) { logger.warn({ e }, 'maybeWipeDatabase error'); }
+    wipedOnce = true;
   }
 
-  try {
-    const sock = await createWhatsApp({ telegram });
-    return sock;
-  } finally {
-    starting = false;
-  }
+  // لا تنشئ سوكِت جديد إن كان موجود
+  if (currentSock) return currentSock;
+
+  currentSock = await createSingleSocket({ telegram });
+
+  // تنظيف مرتب عند الإنهاء
+  const shutdown = () => {
+    logger.warn('SIGTERM/SIGINT: closing WA socket');
+    safeCloseSock(currentSock);
+    currentSock = null;
+  };
+  process.once('SIGINT', shutdown);
+  process.once('SIGTERM', shutdown);
+
+  return currentSock;
 }
 
-module.exports = { createWhatsApp, startWhatsApp };
+module.exports = { startWhatsApp };
