@@ -1,5 +1,5 @@
 // src/app/whatsapp.js
-const { default: makeWASocket, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, fetchLatestBaileysVersion, DisconnectReason } = require('@whiskeysockets/baileys');
 const NodeCache = require('node-cache');
 const logger = require('../lib/logger');
 const { mongoAuthState } = require('../lib/wa-mongo-auth');
@@ -102,11 +102,8 @@ function storeMessage(msg) {
   messageStore.set(msg.key.id, msg);
 }
 
-// ---------- تهيئة واتساب ----------
+// ---------- *إنشاء* سوكِت واتساب ----------
 async function createWhatsApp({ telegram } = {}) {
-  // نفّذ المسح الاختياري قبل تهيئة Baileys
-  await maybeWipeDatabase();
-
   const { state, saveCreds } = await mongoAuthState(logger);
   const { version } = await fetchLatestBaileysVersion();
 
@@ -147,14 +144,31 @@ async function createWhatsApp({ telegram } = {}) {
     if (qr && telegram) {
       try {
         if (typeof telegram.sendQR === 'function') {
-          // دالة جاهزة في مشروعك ترسم QR كصورة وترسله للـ admin
-          await telegram.sendQR(qr);
+          await telegram.sendQR(qr); // صورة QR
         } else if (typeof telegram.sendMessage === 'function') {
-          // بديل نصّي إن لم تتوفر sendQR
           await telegram.sendMessage(process.env.TG_CHAT_ID, 'Scan this WhatsApp QR:\n' + qr);
         }
       } catch (e) {
         logger.warn({ e }, 'Failed to send QR to Telegram');
+      }
+    }
+
+    // ⬅️ إعادة الاتصال تلقائيًا عند الإغلاق ما لم نكن "Logged Out"
+    if (connection === 'close') {
+      const code =
+        lastDisconnect?.error?.output?.statusCode ??
+        lastDisconnect?.error?.statusCode ??
+        lastDisconnect?.statusCode;
+
+      const shouldReconnect = code !== DisconnectReason.loggedOut;
+      if (shouldReconnect) {
+        logger.warn({ code }, 'WA closed, restarting socket...');
+        // مهلة قصيرة لتفادي الازدواجية
+        setTimeout(() => {
+          startWhatsApp({ telegram }).catch(err => logger.error({ err }, 'restart failed'));
+        }, 2000);
+      } else {
+        logger.error('WA logged out — wipe creds or rescan QR to login again.');
       }
     }
   });
@@ -196,21 +210,28 @@ async function createWhatsApp({ telegram } = {}) {
   // Self-Heal بإعدادات آمنة
   registerSelfHeal(sock, { messageStore });
 
-  // تنظيف دوري بسيط من الذاكرة
-  const CLEAN_INTERVAL = Number(process.env.WA_STORE_CLEAN_MS || 10 * 60 * 1000);
-  const cleaner = setInterval(() => {
-    const toDelete = Math.floor(messageStore.size * 0.01);
-    for (let i = 0; i < toDelete; i++) {
-      const k = messageStore.keys().next().value;
-      if (!k) break;
-      messageStore.delete(k);
-    }
-  }, CLEAN_INTERVAL).unref?.();
-
-  process.once('SIGINT',  () => clearInterval(cleaner));
-  process.once('SIGTERM', () => clearInterval(cleaner));
-
   return sock;
 }
 
-module.exports = { createWhatsApp };
+// ---------- *بدء* واتساب مع مسح اختياري + إعادة اتصال تلقائية ----------
+let starting = false;
+async function startWhatsApp({ telegram } = {}) {
+  if (starting) return;
+  starting = true;
+
+  try {
+    // نفّذ المسح الاختياري قبل أول تهيئة فقط
+    await maybeWipeDatabase();
+  } catch (e) {
+    logger.warn({ e }, 'maybeWipeDatabase error (continuing)');
+  }
+
+  try {
+    const sock = await createWhatsApp({ telegram });
+    return sock;
+  } finally {
+    starting = false;
+  }
+}
+
+module.exports = { createWhatsApp, startWhatsApp };
