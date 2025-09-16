@@ -1,7 +1,6 @@
 // src/app/express.js
 const express = require('express');
 const logger = require('../lib/logger');
-const { PORT } = require('../config/settings');
 
 function startExpress() {
   const app = express();
@@ -23,7 +22,11 @@ function startExpress() {
   // جاهزية للخلف proxy (اختياري)
   if (process.env.TRUST_PROXY) app.set('trust proxy', true);
 
-  app.listen(PORT, () => logger.info(`🌐 HTTP server listening on :${PORT}`));
+  // ✅ أهم شيء: استخدم منفذ Render الديناميكي واستمع على 0.0.0.0
+  const PORT = Number(process.env.PORT) || 3000;
+  const HOST = '0.0.0.0';
+
+  app.listen(PORT, HOST, () => logger.info(`🌐 HTTP server listening on ${HOST}:${PORT}`));
   return app;
 }
 
