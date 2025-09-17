@@ -15,16 +15,12 @@ const mongoose = require('mongoose');
 const fs = require('fs');
 const path = require('path');
 
-// ===== بيئة اختيارية =====
-// لتوليد كود اقتران بدل QR أثناء أول تشغيل:
-const PAIR_NUMBER = process.env.PAIR_NUMBER || null;
-// تفعيل رد "echo" للاختبار فقط:
+// ===== إعداد بيئة اختيارية =====
+const PAIR_NUMBER = process.env.PAIR_NUMBER || null; // لطلب كود اقتران بدل QR
 const ENABLE_WA_ECHO = String(process.env.ENABLE_WA_ECHO || '') === '1';
-// أسماء مجموعات Mongo إن كانت مختلفة:
 const CREDS_COL = process.env.BAILEYS_CREDS_COLLECTION || 'baileyscreds';
 const KEYS_COL  = process.env.BAILEYS_KEY_COLLECTION   || 'baileyskeys';
 
-// ===== أدوات مساعدة =====
 const ONCE_FLAG = path.join('/tmp', 'wipe_baileys_done');
 
 function parseList(val) {
@@ -34,6 +30,7 @@ function parseList(val) {
     .filter(Boolean);
 }
 
+// ===== مسح قواعد بايليز بدون لمس اتصال Mongoose العمومي =====
 async function maybeWipeDatabase() {
   const mode = (process.env.WIPE_BAILEYS || '').toLowerCase().trim();
   if (!mode) return;
@@ -49,13 +46,14 @@ async function maybeWipeDatabase() {
     return;
   }
 
+  let conn;
   try {
     logger.warn({ mode }, '🧹 Starting database wipe (WIPE_BAILEYS)');
-    await mongoose.connect(uri, { serverSelectionTimeoutMS: 10000 });
-    const db = mongoose.connection;
+    conn = await mongoose.createConnection(uri, { serverSelectionTimeoutMS: 10000 }).asPromise();
+    const db = conn.db;
 
     if (mode === 'all') {
-      const name = db.name;
+      const name = db.databaseName;
       await db.dropDatabase();
       logger.warn(`🗑️ Dropped entire Mongo database "${name}".`);
     } else if (mode === '1') {
@@ -86,29 +84,25 @@ async function maybeWipeDatabase() {
     }
 
     if (String(process.env.WIPE_BAILEYS_ONCE || '') === '1') {
-      try {
-        fs.writeFileSync(ONCE_FLAG, String(Date.now()));
-      } catch {}
+      try { fs.writeFileSync(ONCE_FLAG, String(Date.now())); } catch {}
     }
   } catch (e) {
     logger.warn({ e }, '❌ Database wipe failed');
   } finally {
-    try {
-      await mongoose.disconnect();
-    } catch {}
+    try { await conn?.close(); } catch {}
   }
 }
 
-// مسح اعتماد بايليز عند تسجيل الخروج النهائي
 async function wipeAuthMongoNow() {
   const uri = process.env.MONGODB_URI;
   if (!uri) {
     logger.warn('MONGODB_URI is empty; cannot wipe auth.');
     return;
   }
+  let conn;
   try {
-    await mongoose.connect(uri, { serverSelectionTimeoutMS: 10000 });
-    const db = mongoose.connection;
+    conn = await mongoose.createConnection(uri, { serverSelectionTimeoutMS: 10000 }).asPromise();
+    const db = conn.db;
     const r1 = await db.collection(CREDS_COL).deleteMany({});
     const r2 = await db.collection(KEYS_COL).deleteMany({});
     logger.warn(
@@ -118,9 +112,7 @@ async function wipeAuthMongoNow() {
   } catch (e) {
     logger.warn({ e }, '❌ wipeAuthMongoNow failed');
   } finally {
-    try {
-      await mongoose.disconnect();
-    } catch {}
+    try { await conn?.close(); } catch {}
   }
 }
 
@@ -142,12 +134,8 @@ let reconnecting = false;
 let generation = 0;
 
 function safeCloseSock(sock) {
-  try {
-    sock?.end?.();
-  } catch {}
-  try {
-    sock?.ws?.close?.();
-  } catch {}
+  try { sock?.end?.(); } catch {}
+  try { sock?.ws?.close?.(); } catch {}
 }
 
 // ===== إنشاء سوكِت واحد =====
@@ -165,11 +153,11 @@ async function createSingleSocket({ telegram } = {}) {
     version,
     auth: state,
     logger,
-    printQRInTerminal: !telegram,      // اطبع QR في اللوج إن لم يكن تيليجرام
+    printQRInTerminal: !telegram,
     emitOwnEvents: false,
     syncFullHistory: false,
     shouldSyncHistoryMessage: () => false,
-    markOnlineOnConnect: true,         // أعلن التواجد بعد الاتصال
+    markOnlineOnConnect: true,
     getMessage: async (key) => (key?.id ? messageStore.get(key.id) : undefined),
     msgRetryCounterCache,
     shouldIgnoreJid: (jid) => jid === 'status@broadcast',
@@ -183,7 +171,7 @@ async function createSingleSocket({ telegram } = {}) {
   // حفظ الاعتماد
   sock.ev.on('creds.update', saveCreds);
 
-  // لوج الاتصال + اقتران بالكود إذا أردت
+  // اتصال وتدفق الحالة
   sock.ev.on('connection.update', async (u) => {
     const { connection, lastDisconnect, qr } = u || {};
     const code =
@@ -193,7 +181,7 @@ async function createSingleSocket({ telegram } = {}) {
 
     logger.info({ gen: myGen, connection, code, hasQR: Boolean(qr) }, 'WA connection.update');
 
-    // إرسال QR إلى تيليجرام عند توفره
+    // إرسال QR إلى تيليجرام
     if (qr && telegram) {
       try {
         if (typeof telegram.sendQR === 'function') {
@@ -206,33 +194,28 @@ async function createSingleSocket({ telegram } = {}) {
       }
     }
 
-    // بديل QR: كود اقتران مرئي مرّة واحدة عند عدم التسجيل
+    // بديل QR: كود اقتران مرئي مرّة واحدة
     try {
       if (!sock.authState.creds?.registered && PAIR_NUMBER) {
         const codeTxt = await sock.requestPairingCode(PAIR_NUMBER);
         logger.info({ code: codeTxt }, 'PAIRING CODE');
       }
-    } catch {
-      // قد لا يكون متاحًا قبل اكتمال بعض الخطوات، تجاهل
-    }
+    } catch {}
 
     if (connection === 'open') {
       logger.info('WA connection open');
-      try {
-        await sock.sendPresenceUpdate('available');
-      } catch {}
+      try { await sock.sendPresenceUpdate('available'); } catch {}
     }
 
     if (connection === 'close') {
       const isLoggedOut = code === DisconnectReason.loggedOut;
       if (isLoggedOut) {
         logger.error('WA logged out — wiping creds in Mongo and stopping.');
-        // امسح الاعتماد من Mongo حتى يظهر QR/Pairing في التشغيل القادم
         await wipeAuthMongoNow();
-        return; // لا تعاود الاتصال تلقائيًا بعد تسجيل الخروج النهائي
+        return; // لا إعادة اتصال بعد تسجيل الخروج النهائي
       }
 
-      // حالات إعادة التشغيل الطبيعية مثل 515 (restart required) أو تقلب الشبكة
+      // إعادة تشغيل نظيفة للحالات مثل 515
       if (!reconnecting) {
         reconnecting = true;
         logger.warn({ gen: myGen, code }, 'WA closed, scheduling clean restart...');
@@ -254,7 +237,7 @@ async function createSingleSocket({ telegram } = {}) {
     }
   });
 
-  // تخزين الرسائل
+  // تخزين الرسائل + Echo اختياري
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     try {
       for (const m of messages || []) {
@@ -262,7 +245,7 @@ async function createSingleSocket({ telegram } = {}) {
         if (rjid === 'status@broadcast') continue;
         storeMessage(m);
 
-        if (!ENABLE_WA_ECHO) continue;   // ألغِ هذا السطر لتفعّل الإيكو دائمًا
+        if (!ENABLE_WA_ECHO) continue;
         if (m.key?.fromMe) continue;
 
         const text =
@@ -292,9 +275,7 @@ async function createSingleSocket({ telegram } = {}) {
 
         const needsResync = u.update?.retry || u.update?.status === 409 || u.update?.status === 410;
         if (needsResync) {
-          try {
-            await sock.resyncAppState?.(['critical_unblock_low']);
-          } catch (e) {
+          try { await sock.resyncAppState?.(['critical_unblock_low']); } catch (e) {
             logger.warn({ e }, 'resyncAppState failed');
           }
         }
@@ -304,7 +285,7 @@ async function createSingleSocket({ telegram } = {}) {
     }
   });
 
-  // تفعيل Self-Heal
+  // Self-Heal
   registerSelfHeal(sock, { messageStore });
 
   return sock;
@@ -314,11 +295,7 @@ async function createSingleSocket({ telegram } = {}) {
 let wipedOnce = false;
 async function startWhatsApp({ telegram } = {}) {
   if (!wipedOnce) {
-    try {
-      await maybeWipeDatabase();
-    } catch (e) {
-      logger.warn({ e }, 'maybeWipeDatabase error');
-    }
+    try { await maybeWipeDatabase(); } catch (e) { logger.warn({ e }, 'maybeWipeDatabase error'); }
     wipedOnce = true;
   }
 
