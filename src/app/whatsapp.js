@@ -20,6 +20,7 @@ const PAIR_NUMBER = process.env.PAIR_NUMBER || null; // لطلب كود اقتر
 const ENABLE_WA_ECHO = String(process.env.ENABLE_WA_ECHO || '') === '1';
 const CREDS_COL = process.env.BAILEYS_CREDS_COLLECTION || 'baileyscreds';
 const KEYS_COL  = process.env.BAILEYS_KEY_COLLECTION   || 'baileyskeys';
+const MONGO_URI = process.env.MONGODB_URI || '';
 
 const ONCE_FLAG = path.join('/tmp', 'wipe_baileys_done');
 
@@ -30,43 +31,48 @@ function parseList(val) {
     .filter(Boolean);
 }
 
+// تحذير صريح عند تفعيل المسح في الإنتاج
+if (process.env.WIPE_BAILEYS && process.env.WIPE_BAILEYS !== '0') {
+  logger.warn('WIPE_BAILEYS مفعّل. سيؤدي هذا إلى حذف اعتماد Baileys. رجاءً عطّل هذا المتغيّر في الإنتاج.');
+}
+
 // ===== مسح قواعد بايليز بدون لمس اتصال Mongoose العمومي =====
 async function maybeWipeDatabase() {
   const mode = (process.env.WIPE_BAILEYS || '').toLowerCase().trim();
   if (!mode) return;
 
   if (String(process.env.WIPE_BAILEYS_ONCE || '') === '1' && fs.existsSync(ONCE_FLAG)) {
-    logger.warn('WIPE_BAILEYS_ONCE=1: wipe already performed previously; skipping.');
+    logger.warn('WIPE_BAILEYS_ONCE=1: تمت عملية المسح سابقاً؛ سيتم التخطي الآن.');
     return;
   }
 
   const uri = process.env.MONGODB_URI;
   if (!uri) {
-    logger.warn('WIPE_BAILEYS is set, but MONGODB_URI is empty. Skipping wipe.');
+    logger.warn('WIPE_BAILEYS مفعّل لكن MONGODB_URI فارغ. سيتم التخطي.');
     return;
   }
 
   let conn;
   try {
-    logger.warn({ mode }, '🧹 Starting database wipe (WIPE_BAILEYS)');
+    logger.warn({ mode }, '🧹 بدء مسح قاعدة البيانات (WIPE_BAILEYS)');
     conn = await mongoose.createConnection(uri, { serverSelectionTimeoutMS: 10000 }).asPromise();
     const db = conn.db;
 
     if (mode === 'all') {
       const name = db.databaseName;
       await db.dropDatabase();
-      logger.warn(`🗑️ Dropped entire Mongo database "${name}".`);
+      logger.warn(`🗑️ تم إسقاط قاعدة البيانات كاملة "${name}".`);
     } else if (mode === '1') {
       const r1 = await db.collection(CREDS_COL).deleteMany({});
       const r2 = await db.collection(KEYS_COL).deleteMany({});
       logger.warn(
         { collections: [CREDS_COL, KEYS_COL], deleted: { [CREDS_COL]: r1?.deletedCount || 0, [KEYS_COL]: r2?.deletedCount || 0 } },
-        '✅ Wiped Baileys collections'
+        '✅ تم مسح مجموعات Baileys'
       );
     } else if (mode === 'custom') {
       const list = parseList(process.env.WIPE_BAILEYS_COLLECTIONS);
       if (!list.length) {
-        logger.warn('WIPE_BAILEYS=custom but WIPE_BAILEYS_COLLECTIONS is empty. Skipping.');
+        logger.warn('WIPE_BAILEYS=custom لكن WIPE_BAILEYS_COLLECTIONS فارغ. سيتم التخطي.');
       } else {
         const deleted = {};
         for (const colName of list) {
@@ -74,20 +80,20 @@ async function maybeWipeDatabase() {
             const res = await db.collection(colName).deleteMany({});
             deleted[colName] = res?.deletedCount || 0;
           } catch (e) {
-            logger.warn({ colName, e }, 'Failed to wipe collection');
+            logger.warn({ colName, e }, 'فشل مسح المجموعة');
           }
         }
-        logger.warn({ deleted }, '✅ Wiped custom collections');
+        logger.warn({ deleted }, '✅ تم مسح مجموعات مخصّصة');
       }
     } else {
-      logger.warn({ mode }, 'Unknown WIPE_BAILEYS mode; skipping.');
+      logger.warn({ mode }, 'وضع WIPE_BAILEYS غير معروف؛ سيتم التخطي.');
     }
 
     if (String(process.env.WIPE_BAILEYS_ONCE || '') === '1') {
       try { fs.writeFileSync(ONCE_FLAG, String(Date.now())); } catch {}
     }
   } catch (e) {
-    logger.warn({ e }, '❌ Database wipe failed');
+    logger.warn({ e }, '❌ فشل مسح قاعدة البيانات');
   } finally {
     try { await conn?.close(); } catch {}
   }
@@ -96,7 +102,7 @@ async function maybeWipeDatabase() {
 async function wipeAuthMongoNow() {
   const uri = process.env.MONGODB_URI;
   if (!uri) {
-    logger.warn('MONGODB_URI is empty; cannot wipe auth.');
+    logger.warn('MONGODB_URI فارغ؛ لا يمكن مسح الاعتماد.');
     return;
   }
   let conn;
@@ -107,10 +113,10 @@ async function wipeAuthMongoNow() {
     const r2 = await db.collection(KEYS_COL).deleteMany({});
     logger.warn(
       { collections: [CREDS_COL, KEYS_COL], deleted: { [CREDS_COL]: r1?.deletedCount || 0, [KEYS_COL]: r2?.deletedCount || 0 } },
-      '🧹 Wiped Baileys auth after loggedOut'
+      '🧹 تم مسح اعتماد Baileys بعد loggedOut'
     );
   } catch (e) {
-    logger.warn({ e }, '❌ wipeAuthMongoNow failed');
+    logger.warn({ e }, '❌ فشل wipeAuthMongoNow');
   } finally {
     try { await conn?.close(); } catch {}
   }
@@ -140,6 +146,11 @@ function safeCloseSock(sock) {
 
 // ===== إنشاء سوكِت واحد =====
 async function createSingleSocket({ telegram } = {}) {
+  // فشل سريع إذا لم تتوفر قاعدة بيانات لاستمرارية الاعتماد
+  if (!MONGO_URI) {
+    throw new Error('MONGODB_URI مطلوب لاستمرارية جلسة WhatsApp. أضف المتغيّر في بيئة التشغيل.');
+  }
+
   const { state, saveCreds } = await mongoAuthState(logger);
   const { version } = await fetchLatestBaileysVersion();
 
@@ -210,7 +221,7 @@ async function createSingleSocket({ telegram } = {}) {
     if (connection === 'close') {
       const isLoggedOut = code === DisconnectReason.loggedOut;
       if (isLoggedOut) {
-        logger.error('WA logged out — wiping creds in Mongo and stopping.');
+        logger.error('WA logged out — سيتم مسح الاعتماد وإيقاف الخدمة.');
         await wipeAuthMongoNow();
         return; // لا إعادة اتصال بعد تسجيل الخروج النهائي
       }
@@ -294,6 +305,11 @@ async function createSingleSocket({ telegram } = {}) {
 // ===== نقطة البدء =====
 let wipedOnce = false;
 async function startWhatsApp({ telegram } = {}) {
+  // فشل سريع إذا لم تتوفر قاعدة بيانات لاستمرارية الاعتماد
+  if (!MONGO_URI) {
+    throw new Error('MONGODB_URI مطلوب. بدونه ستفقد الجلسة بعد كل إعادة تشغيل.');
+  }
+
   if (!wipedOnce) {
     try { await maybeWipeDatabase(); } catch (e) { logger.warn({ e }, 'maybeWipeDatabase error'); }
     wipedOnce = true;
