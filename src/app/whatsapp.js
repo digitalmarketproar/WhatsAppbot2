@@ -12,6 +12,7 @@ const { mongoAuthState } = require('../lib/wa-mongo-auth');
 const { registerSelfHeal } = require('../lib/selfheal');
 
 const mongoose = require('mongoose');
+const { MongoClient } = require('mongodb'); // ← لقفل أحادي
 const fs = require('fs');
 const path = require('path');
 
@@ -24,6 +25,74 @@ const MONGO_URI = process.env.MONGODB_URI || '';
 
 const ONCE_FLAG = path.join('/tmp', 'wipe_baileys_done');
 
+// ===== قفل أحادي عبر Mongo لمنع تشغيل مثيلين =====
+const WA_LOCK_KEY = process.env.WA_LOCK_KEY || '_wa_singleton_lock';
+const WA_LOCK_TTL_MS = Number(process.env.WA_LOCK_TTL_MS || 60_000);
+let _lockRenewTimer = null;
+let _lockMongoClient = null;
+
+async function acquireLockOrExit() {
+  if (!MONGO_URI) {
+    throw new Error('MONGODB_URI مطلوب لاستمرارية جلسة WhatsApp.');
+  }
+  const holderId =
+    process.env.RENDER_INSTANCE_ID ||
+    process.env.HOSTNAME ||
+    String(process.pid);
+
+  _lockMongoClient = new MongoClient(MONGO_URI, { serverSelectionTimeoutMS: 8000 });
+  await _lockMongoClient.connect();
+  const db = _lockMongoClient.db();               // نفس DB في الـ URI
+  const col = db.collection('locks');             // تجميعة القفل
+  await col.createIndex({ _id: 1 }, { unique: true });
+
+  const now = Date.now();
+  const res = await col.findOneAndUpdate(
+    { _id: WA_LOCK_KEY, $or: [{ expiresAt: { $lte: now } }, { expiresAt: { $exists: false } }] },
+    { $set: { _id: WA_LOCK_KEY, holder: holderId, expiresAt: now + WA_LOCK_TTL_MS } },
+    { upsert: true, returnDocument: 'after' }
+  );
+
+  // تحقق أن القفل صار لنا فعلاً
+  const got = await col.findOne({ _id: WA_LOCK_KEY });
+  if (!got || got.holder !== holderId || got.expiresAt <= now) {
+    logger.error({ got, holderId }, 'WA lock not acquired. Exiting.');
+    process.exit(0);
+  }
+
+  // جدّد القفل دورياً
+  _lockRenewTimer = setInterval(async () => {
+    try {
+      await col.updateOne(
+        { _id: WA_LOCK_KEY, holder: holderId },
+        { $set: { expiresAt: Date.now() + WA_LOCK_TTL_MS } }
+      );
+    } catch (e) {
+      logger.warn({ e }, 'Failed to renew WA lock');
+    }
+  }, Math.max(5_000, Math.floor(WA_LOCK_TTL_MS / 2)));
+  _lockRenewTimer.unref?.();
+
+  logger.info({ holderId, key: WA_LOCK_KEY }, '✅ Acquired WA singleton lock');
+}
+
+function releaseLock() {
+  const holderId =
+    process.env.RENDER_INSTANCE_ID ||
+    process.env.HOSTNAME ||
+    String(process.pid);
+  try { _lockRenewTimer && clearInterval(_lockRenewTimer); } catch {}
+  (async () => {
+    try {
+      if (_lockMongoClient) {
+        const db = _lockMongoClient.db();
+        await db.collection('locks').deleteOne({ _id: WA_LOCK_KEY, holder: holderId });
+      }
+    } catch {}
+    try { await _lockMongoClient?.close?.(); } catch {}
+  })().catch(() => {});
+}
+
 function parseList(val) {
   return String(val || '')
     .split(',')
@@ -33,7 +102,7 @@ function parseList(val) {
 
 // تحذير صريح عند تفعيل المسح في الإنتاج
 if (process.env.WIPE_BAILEYS && process.env.WIPE_BAILEYS !== '0') {
-  logger.warn('WIPE_BAILEYS مفعّل. سيؤدي هذا إلى حذف اعتماد Baileys. رجاءً عطّل هذا المتغيّر في الإنتاج.');
+  logger.warn('WIPE_BAILEYS مفعّل. سيؤدي هذا إلى حذف اعتماد Baileys. عطّل هذا المتغيّر في الإنتاج.');
 }
 
 // ===== مسح قواعد بايليز بدون لمس اتصال Mongoose العمومي =====
@@ -146,7 +215,6 @@ function safeCloseSock(sock) {
 
 // ===== إنشاء سوكِت واحد =====
 async function createSingleSocket({ telegram } = {}) {
-  // فشل سريع إذا لم تتوفر قاعدة بيانات لاستمرارية الاعتماد
   if (!MONGO_URI) {
     throw new Error('MONGODB_URI مطلوب لاستمرارية جلسة WhatsApp. أضف المتغيّر في بيئة التشغيل.');
   }
@@ -223,7 +291,7 @@ async function createSingleSocket({ telegram } = {}) {
       if (isLoggedOut) {
         logger.error('WA logged out — سيتم مسح الاعتماد وإيقاف الخدمة.');
         await wipeAuthMongoNow();
-        return; // لا إعادة اتصال بعد تسجيل الخروج النهائي
+        return;
       }
 
       // إعادة تشغيل نظيفة للحالات مثل 515
@@ -305,10 +373,12 @@ async function createSingleSocket({ telegram } = {}) {
 // ===== نقطة البدء =====
 let wipedOnce = false;
 async function startWhatsApp({ telegram } = {}) {
-  // فشل سريع إذا لم تتوفر قاعدة بيانات لاستمرارية الاعتماد
   if (!MONGO_URI) {
     throw new Error('MONGODB_URI مطلوب. بدونه ستفقد الجلسة بعد كل إعادة تشغيل.');
   }
+
+  // احصل على القفل قبل أي شيء
+  await acquireLockOrExit();
 
   if (!wipedOnce) {
     try { await maybeWipeDatabase(); } catch (e) { logger.warn({ e }, 'maybeWipeDatabase error'); }
@@ -323,6 +393,7 @@ async function startWhatsApp({ telegram } = {}) {
     logger.warn('SIGTERM/SIGINT: closing WA socket');
     safeCloseSock(currentSock);
     currentSock = null;
+    releaseLock(); // تحرير القفل عند الإغلاق
   };
   process.once('SIGINT', shutdown);
   process.once('SIGTERM', shutdown);
