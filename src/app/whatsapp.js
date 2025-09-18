@@ -38,37 +38,47 @@ if (process.env.WIPE_BAILEYS && process.env.WIPE_BAILEYS !== '0') {
 }
 
 /* ===== قفل أحادي عبر Mongo لمنع تشغيل مثيلين ===== */
+// ===== قفل أحادي عبر Mongo =====
 const WA_LOCK_KEY = process.env.WA_LOCK_KEY || '_wa_singleton_lock';
 const WA_LOCK_TTL_MS = Number(process.env.WA_LOCK_TTL_MS || 60_000);
 let _lockRenewTimer = null;
 let _lockMongoClient = null;
 
 async function acquireLockOrExit() {
-  if (!MONGO_URI) throw new Error('MONGODB_URI مطلوب لاستمرارية جلسة WhatsApp.');
+  if (!MONGO_URI) throw new Error('MONGODB_URI مطلوب.');
 
   const holderId = process.env.RENDER_INSTANCE_ID || process.env.HOSTNAME || String(process.pid);
 
-  _lockMongoClient = new MongoClient(MONGO_URI, { serverSelectionTimeoutMS: 8000 });
+  _lockMongoClient = new (require('mongodb').MongoClient)(MONGO_URI, { serverSelectionTimeoutMS: 8000 });
   await _lockMongoClient.connect();
   const db = _lockMongoClient.db();
-  const col = db.collection('locks'); // لا تُنشئ فهرسًا على _id؛ هو فريد افتراضياً.
+  const col = db.collection('locks');
 
   const now = Date.now();
+  const doc = { _id: WA_LOCK_KEY, holder: holderId, expiresAt: now + WA_LOCK_TTL_MS };
 
-  // تحديث ذري: احصل على القفل إن كان منتهيًا أو كان مملوكًا لنا
-  const res = await col.findOneAndUpdate(
-    { _id: WA_LOCK_KEY, $or: [ { expiresAt: { $lte: now } }, { holder: holderId } ] },
-    { $set: { holder: holderId, expiresAt: now + WA_LOCK_TTL_MS } },
-    { upsert: true, returnDocument: 'after' }
-  );
-
-  const got = res?.value;
-  if (!got || got.holder !== holderId) {
-    logger.error({ got, holderId }, 'WA lock not acquired. Exiting.');
-    process.exit(0);
+  // 1) محاولة إدراج أولية: لو نجحت نملك القفل
+  try {
+    await col.insertOne(doc);
+    logger.info({ holderId, key: WA_LOCK_KEY }, '✅ Acquired WA singleton lock (insert).');
+  } catch (e) {
+    // 2) لو موجود مسبقاً: جرّب الاستحواذ فقط إذا انتهى
+    if (e?.code !== 11000) { // ليس DuplicateKey
+      logger.error({ e }, 'Lock insert failed unexpectedly'); process.exit(0);
+    }
+    const res = await col.findOneAndUpdate(
+      { _id: WA_LOCK_KEY, expiresAt: { $lte: now } }, // انتهى
+      { $set: { holder: holderId, expiresAt: now + WA_LOCK_TTL_MS } },
+      { returnDocument: 'after' }
+    );
+    if (!res.value || res.value.holder !== holderId) {
+      logger.error({ holderId }, 'WA lock not acquired (held by another live instance). Exiting.');
+      process.exit(0);
+    }
+    logger.info({ holderId, key: WA_LOCK_KEY }, '✅ Acquired WA singleton lock (takeover).');
   }
 
-  // تجديد القفل دورياً
+  // تجديد القفل
   _lockRenewTimer = setInterval(async () => {
     try {
       await col.updateOne(
@@ -80,8 +90,6 @@ async function acquireLockOrExit() {
     }
   }, Math.max(5000, Math.floor(WA_LOCK_TTL_MS / 2)));
   _lockRenewTimer.unref?.();
-
-  logger.info({ holderId, key: WA_LOCK_KEY }, '✅ Acquired WA singleton lock');
 }
 
 function releaseLock() {
