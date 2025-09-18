@@ -37,7 +37,7 @@ if (process.env.WIPE_BAILEYS && process.env.WIPE_BAILEYS !== '0') {
   logger.warn('WIPE_BAILEYS مفعّل. سيؤدي هذا إلى حذف اعتماد Baileys. عطّل هذا المتغيّر في الإنتاج.');
 }
 
-/* ===== قفل أحادي عبر Mongo لمنع تشغيل مثيلين ===== */
+
 // ===== قفل أحادي عبر Mongo =====
 const WA_LOCK_KEY = process.env.WA_LOCK_KEY || '_wa_singleton_lock';
 const WA_LOCK_TTL_MS = Number(process.env.WA_LOCK_TTL_MS || 60_000);
@@ -64,17 +64,22 @@ async function acquireLockOrExit() {
   } catch (e) {
     // 2) لو موجود مسبقاً: جرّب الاستحواذ فقط إذا انتهى
     if (e?.code !== 11000) { // ليس DuplicateKey
-      logger.error({ e }, 'Lock insert failed unexpectedly'); process.exit(0);
+      logger.error({ e }, 'Lock insert failed unexpectedly');
+      process.exit(0);
     }
-    const res = await col.findOneAndUpdate(
+
+    // في Driver v5: findOneAndUpdate تُرجع الوثيقة مباشرة (null إذا لا يوجد)
+    const docAfter = await col.findOneAndUpdate(
       { _id: WA_LOCK_KEY, expiresAt: { $lte: now } }, // انتهى
       { $set: { holder: holderId, expiresAt: now + WA_LOCK_TTL_MS } },
       { returnDocument: 'after' }
     );
-    if (!res.value || res.value.holder !== holderId) {
+
+    if (!docAfter || docAfter.holder !== holderId) {
       logger.error({ holderId }, 'WA lock not acquired (held by another live instance). Exiting.');
       process.exit(0);
     }
+
     logger.info({ holderId, key: WA_LOCK_KEY }, '✅ Acquired WA singleton lock (takeover).');
   }
 
