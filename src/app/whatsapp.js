@@ -5,6 +5,7 @@ const { default: makeWASocket, fetchLatestBaileysVersion, DisconnectReason } = r
 const { MongoClient }  = require('mongodb');
 const mongoose         = require('mongoose');
 const NodeCache        = require('node-cache');
+const QRCode           = require('qrcode'); // ← لتوليد صورة QR
 
 const logger           = require('../lib/logger');
 const { mongoAuthState } = require('../lib/wa-mongo-auth');
@@ -12,7 +13,7 @@ const { registerSelfHeal } = require('../lib/selfheal');
 
 const MONGO_URI   = process.env.MONGODB_URI || process.env.MONGODB_URL;
 const WA_LOCK_KEY = process.env.WA_LOCK_KEY || 'wa_lock_singleton';
-const PAIR_NUMBER = process.env.PAIR_NUMBER || null;
+// NOTE: سنُهمل PAIR_NUMBER الآن لأننا سنستخدم QR فقط.
 const ENABLE_WA_ECHO = String(process.env.ENABLE_WA_ECHO || '') === '1';
 
 let _lockMongoClient = null;
@@ -24,15 +25,22 @@ async function acquireLockOrExit() {
   _lockMongoClient = new MongoClient(MONGO_URI, { serverSelectionTimeoutMS: 8000 });
   await _lockMongoClient.connect();
   const col = _lockMongoClient.db().collection('locks');
-  const doc = { _id: WA_LOCK_KEY, holderId, ts: Date.now() };
-  try {
-    await col.insertOne(doc);
-    _lockHeld = true;
-    logger.info({ holderId, key: WA_LOCK_KEY }, '✅ Acquired WA singleton lock (insert).');
-  } catch (e) {
-    logger.warn({ e: e.message }, 'Another instance holds the lock. Exiting.');
+
+  // تحسين: upsert مع انتهاء صلاحية لمنع E11000
+  const now = Date.now();
+  const STALE_MS = 3 * 60 * 1000; // 3 دقائق
+  const res = await col.updateOne(
+    { _id: WA_LOCK_KEY, $or: [{ holderId }, { ts: { $lt: now - STALE_MS } }, { holderId: { $exists: false } }] },
+    { $set: { holderId, ts: now } },
+    { upsert: true }
+  );
+  const matched = res.matchedCount + (res.upsertedCount || 0);
+  if (!matched) {
+    logger.warn('Another instance holds the lock. Exiting.');
     process.exit(0);
   }
+  _lockHeld = true;
+  logger.info({ holderId, key: WA_LOCK_KEY }, '✅ Acquired/Refreshed WA singleton lock.');
 }
 
 async function releaseLock() {
@@ -50,11 +58,11 @@ function safeCloseSock(s) {
 
 async function createSocket({ telegram }) {
   const { version } = await fetchLatestBaileysVersion();
-  const { state, saveCreds, clearAuth, getHasCreds } = await mongoAuthState(logger);
+  const { state, saveCreds, clearAuth } = await mongoAuthState(logger);
 
   const sock = makeWASocket({
     version,
-    printQRInTerminal: false,
+    printQRInTerminal: false,  // سنرسل الصورة إلى تليجرام بدل الطباعة
     auth: state,
     logger,
     syncFullHistory: false,
@@ -68,16 +76,35 @@ async function createSocket({ telegram }) {
   // مسجّل ذاتي لمعالجة أخطاء المفاتيح (لا يلمس creds)
   registerSelfHeal(sock, logger);
 
-  // QR → إلى تليجرام
+  let awaitingPairing = false;
+  let restartTimer = null;
+
+  // QR → توليد صورة PNG وإرسالها لتليجرام
   sock.ev.on('connection.update', async (u) => {
     const { connection, lastDisconnect, qr } = u;
 
     if (qr) {
-      try { await telegram?.sendQR(qr); } catch {}
+      try {
+        // حوّل النص إلى صورة PNG
+        const png = await QRCode.toBuffer(qr, { width: 360, margin: 1 });
+        if (telegram?.sendPhoto) {
+          await telegram.sendPhoto(png, { caption: 'Scan this WhatsApp QR within 1 minute' });
+        } else if (telegram?.sendQR) {
+          // احتياطي: أرسل النص إذا ما في sendPhoto
+          await telegram.sendQR(qr);
+        }
+        awaitingPairing = true;
+      } catch (e) {
+        logger.warn({ e: e.message }, 'Failed to render/send QR; sending raw text as fallback.');
+        try { await telegram?.sendQR?.(qr); } catch {}
+        awaitingPairing = true;
+      }
     }
 
     if (connection === 'open') {
       logger.info('connected to WA');
+      awaitingPairing = false;
+      if (restartTimer) { clearTimeout(restartTimer); restartTimer = null; }
     }
 
     if (connection === 'close') {
@@ -85,14 +112,19 @@ async function createSocket({ telegram }) {
       logger.info({ code }, 'WA connection.close');
 
       if (code === DisconnectReason.loggedOut || code === 401) {
-        logger.warn('WA logged out — wiping & restart.');
-        await clearAuth(); // ← يمسح BaileysCreds / BaileysKey فعليًا
-        // أعد البدء: سيظهر QR أو سنستخدم Pairing
-        setTimeout(() => startWhatsApp({ telegram }), 1500);
+        logger.warn('WA logged out — wiping. Waiting 90s to allow QR scan before restart.');
+        await clearAuth();
+
+        // انتظر 90 ثانية لإتاحة مسح الـQR
+        if (restartTimer) clearTimeout(restartTimer);
+        restartTimer = setTimeout(() => {
+          // لو لم يتم الارتباط خلال المهلة، أعد البدء
+          if (awaitingPairing) startWhatsApp({ telegram });
+        }, 90_000);
         return;
       }
 
-      // أخطاء أخرى: أعد المحاولة
+      // أخطاء أخرى: أعد المحاولة بعد 1.5 ثانية
       setTimeout(() => startWhatsApp({ telegram }), 1500);
     }
   });
@@ -110,16 +142,8 @@ async function createSocket({ telegram }) {
     });
   }
 
-  // إذا لا توجد creds مسجلة، أعطِ Pairing Code بدل QR (أنسب على السيرفر)
-  try {
-    const has = await getHasCreds();
-    if (!has && PAIR_NUMBER) {
-      const code = await sock.requestPairingCode(PAIR_NUMBER);
-      await telegram?.notify?.(`Pairing code: ${code}`); // سيصل للأدمِن على تليجرام
-    }
-  } catch (e) {
-    logger.warn({ e: e.message }, 'pairing code failed');
-  }
+  // هام: لا نطلب pairing code إطلاقًا الآن (نستخدم QR فقط)
+  // (لا تفعل: await sock.requestPairingCode(...))
 
   return sock;
 }
