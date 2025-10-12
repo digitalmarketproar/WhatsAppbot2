@@ -1,27 +1,38 @@
-// index.js
-const { startExpress } = require('./src/app/express');
-const { startWhatsApp } = require('./src/app/whatsapp');   // ⬅️ بدّل createWhatsApp بـ startWhatsApp
-const { onMessageUpsert } = require('./src/handlers/messages');
-const { registerGroupParticipantHandler } = require('./src/handlers/groups');
-const { connectMongo } = require('./src/lib/db');
-const { TELEGRAM_TOKEN, TELEGRAM_ADMIN_ID, MONGODB_URI } = require('./src/config/settings');
-const { startTelegram } = require('./src/app/telegram');
-const logger = require('./src/lib/logger');
+'use strict';
+
+/**
+ * نقطة تشغيل الخدمة:
+ * - يشغّل خادم HTTP صحي للـ Render
+ * - يشغّل بوت تيليجرام
+ * - يشغّل واتساب (وسيُعيد ربط مستمع الرسائل داخليًا عند أي إعادة اتصال)
+ */
+
+const http    = require('http');
+const logger  = require('./lib/logger');
+const { startTelegram } = require('./app/telegram');
+const { startWhatsApp } = require('./app/whatsapp');
+
+// خادم صحي بسيط لطلبات Render
+const PORT = process.env.PORT || 10000;
+http.createServer((req, res) => {
+  res.statusCode = 200;
+  res.end('OK');
+  try {
+    logger.info(
+      { ua: req.headers['user-agent'], path: req.url, method: req.method, ip: req.socket?.remoteAddress },
+      'HTTP'
+    );
+  } catch {}
+}).listen(PORT, '0.0.0.0', () => {
+  logger.info(`🌐 HTTP server listening on 0.0.0.0:${PORT}`);
+});
 
 (async () => {
-  startExpress();
-  await connectMongo(MONGODB_URI).catch(e =>
-    logger.warn('Mongo not connected: ' + e.message)
-  );
-
-  const telegram = startTelegram(TELEGRAM_TOKEN, TELEGRAM_ADMIN_ID);
-
-  // ⬅️ استعمل startWhatsApp بدل createWhatsApp
-  const sock = await startWhatsApp({ telegram });
-
-  // handlers
-  sock.ev.on('messages.upsert', onMessageUpsert(sock));
-  registerGroupParticipantHandler(sock);
-
-  logger.info('✅ Bot started (groups: moderation only; DMs: replies).');
+  try {
+    const telegram = startTelegram();          // بوت تيليجرام (لإرسال QR… إلخ)
+    await startWhatsApp({ telegram });         // بوت واتساب — مستمع الرسائل يُسجل داخل startWhatsApp
+  } catch (e) {
+    logger.error({ err: e, stack: e?.stack }, 'Fatal error in bootstrap');
+    process.exit(1);
+  }
 })();
