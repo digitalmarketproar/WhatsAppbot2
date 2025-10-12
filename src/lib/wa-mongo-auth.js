@@ -2,97 +2,68 @@
 'use strict';
 
 const { MongoClient } = require('mongodb');
-const { initAuthCreds } = require('@whiskeysockets/baileys');
+const makeDebug = require('./logger'); // لو كان لوجركم ديفولت اتركه
+const logger = makeDebug.child ? makeDebug.child({ scope: 'wa-mongo-auth' }) : console;
 
-const MONGO_URI = process.env.MONGODB_URI || process.env.MONGODB_URL;
+// أسماء التجميعات من متغيرات البيئة
+const DB_NAME   = process.env.MONGODB_DBNAME || undefined; // اختياري، يختار من URI إن لم يوجد
 const CREDS_COL = process.env.BAILEYS_CREDS_COLLECTION || 'BaileysCreds';
-const KEYS_COL  = process.env.BAILEYS_KEY_COLLECTION  || 'BaileysKey';
+const KEYS_COL  = process.env.BAILEYS_KEY_COLLECTION   || 'BaileysKey';
 
-let _client; // shared client
-let _db;
-let _credsCol;
-let _keysCol;
-
-async function ensureMongo(logger) {
-  if (_db) return;
-  if (!_client) {
-    _client = new MongoClient(MONGO_URI, { serverSelectionTimeoutMS: 8000 });
-    await _client.connect();
+// ————— أدوات تحويل BSON Binary → Buffer —————
+function toBufferIfBinary(v) {
+  // Buffer أو Uint8Array: أرجعه Buffer
+  if (Buffer.isBuffer(v) || v instanceof Uint8Array) return Buffer.from(v);
+  // MongoDB Binary: في الإصدارات الحديثة يكون كائن بـ _bsontype = 'Binary'
+  if (v && typeof v === 'object' && v._bsontype === 'Binary') {
+    // v.buffer هو Buffer داخلي
+    return Buffer.from(v.buffer);
   }
-  _db = _client.db(); // default DB from URI
-  _credsCol = _db.collection(CREDS_COL);
-  _keysCol  = _db.collection(KEYS_COL);
-
-  // فهرس بسيط للمفاتيح
-  await _keysCol.createIndex({ _id: 1 }, { unique: true }).catch(() => {});
+  return v;
 }
 
-/**
- * بايليز يتوقع:
- *  state: { creds, keys }
- *  keys.get({ type, ids }) -> { [id]: value | undefined }  (مهم: ليس null)
- *  keys.set([{ type, id, value }])
- */
-async function mongoAuthState(logger = console) {
-  await ensureMongo(logger);
+function deepNormalize(obj) {
+  if (obj == null) return obj;
+  if (Array.isArray(obj)) return obj.map(deepNormalize);
+  if (typeof obj === 'object') {
+    // بعض الحقول تكون { type, data } أو باينري مباشر
+    const direct = toBufferIfBinary(obj);
+    if (Buffer.isBuffer(direct)) return direct;
 
-  // تحميل الاعتماد
-  let credsDoc = await _credsCol.findOne({ _id: 'creds' });
-  let creds = credsDoc?.data ? credsDoc.data : initAuthCreds();
+    const out = {};
+    for (const k of Object.keys(obj)) {
+      out[k] = deepNormalize(obj[k]);
+    }
+    return out;
+  }
+  return obj;
+}
 
-  // --- مفاتيح الإشارة ---
-  const keys = {
-    /**
-     * @param {{type: string, ids: string[]}} param0
-     * @returns {Promise<Record<string, any>>}
-     */
-    async get({ type, ids }) {
-      if (!Array.isArray(ids) || ids.length === 0) return {};
-      // مفاتيحنا مخزنة بـ _id = `${type}:${id}`
-      const queryIds = ids.map((id) => `${type}:${id}`);
-      const docs = await _keysCol
-        .find({ _id: { $in: queryIds } })
-        .project({ _id: 1, value: 1 })
-        .toArray();
+// ————— واجهة بايليز auth state —————
+async function mongoAuthState(extLogger) {
+  const log = extLogger || logger;
 
-      const out = {};
-      // عَبِّئ الموجود
-      for (const d of docs) {
-        const [, id] = String(d._id).split(':');
-        out[id] = d.value;
-      }
-      // القيَم غير الموجودة يجب أن تبقى undefined وليس null
-      for (const id of ids) {
-        if (!(id in out)) out[id] = undefined;
-      }
-      return out; // مهم: كائن، ليس null
-    },
+  const MONGO_URI = process.env.MONGODB_URI || process.env.MONGODB_URL;
+  if (!MONGO_URI) throw new Error('MONGODB_URI required');
 
-    /**
-     * @param {{type: string, id: string, value: any}[]} data
-     */
-    async set(data) {
-      if (!Array.isArray(data) || data.length === 0) return;
-      const ops = data.map(({ type, id, value }) => ({
-        updateOne: {
-          filter: { _id: `${type}:${id}` },
-          update: { $set: { value } },
-          upsert: true,
-        },
-      }));
-      await _keysCol.bulkWrite(ops, { ordered: false });
-    },
+  const client = new MongoClient(MONGO_URI, { serverSelectionTimeoutMS: 8000 });
+  await client.connect();
+  const db  = DB_NAME ? client.db(DB_NAME) : client.db();
+  const cCreds = db.collection(CREDS_COL);
+  const cKeys  = db.collection(KEYS_COL);
 
-    // اختيارية: حذف مفاتيح محددة (نادرًا ما تُستخدم)
-    async delete({ type, ids }) {
-      if (!Array.isArray(ids) || ids.length === 0) return;
-      const delIds = ids.map((id) => `${type}:${id}`);
-      await _keysCol.deleteMany({ _id: { $in: delIds } });
-    },
-  };
+  // ——— creds ———
+  async function readCreds() {
+    const doc = await cCreds.findOne({ _id: 'creds' });
+    if (!doc) return null;
+    // مهم: نحول أي Binary داخل الشجرة إلى Buffer
+    const data = deepNormalize(doc.data || doc);
+    return data;
+  }
 
-  async function saveCreds() {
-    await _credsCol.updateOne(
+  async function writeCreds(creds) {
+    // يمكن تخزين الـ Buffer كما هو؛ درايفر Mongo سيحوله Binary داخليًا.
+    await cCreds.updateOne(
       { _id: 'creds' },
       { $set: { data: creds } },
       { upsert: true }
@@ -100,18 +71,72 @@ async function mongoAuthState(logger = console) {
   }
 
   async function clearAuth() {
-    await Promise.all([
-      _credsCol.deleteMany({}),
-      _keysCol.deleteMany({}),
-    ]);
+    await cCreds.deleteMany({});
+    await cKeys.deleteMany({});
   }
 
   async function getHasCreds() {
-    const c = await _credsCol.findOne({ _id: 'creds' });
-    return !!c;
+    const doc = await cCreds.findOne({ _id: 'creds' }, { projection: { _id: 1 }});
+    return !!doc;
   }
 
-  const state = { creds, keys };
+  // ——— keys (sessions / sender keys / app state) ———
+  // بايليز تتوقع دوال: get(type, ids) و set(data)
+  const keys = {
+    /**
+     * type: 'pre-key' | 'session' | 'app-state-sync-key' | 'sender-key' | ...
+     * ids:  string[]
+     */
+    get: async (type, ids) => {
+      const result = {};
+      if (!ids?.length) return result;
+
+      const cursor = cKeys.find({ type, id: { $in: ids } });
+      const list = await cursor.toArray();
+
+      // رجع القيم الطبيعية (Buffer بدل Binary)
+      for (const it of list) {
+        // بعض الأنواع قيمها كائنات مع بايتات داخلية؛ نطبّق deepNormalize دائمًا
+        result[it.id] = deepNormalize(it.value);
+      }
+      return result;
+    },
+
+    /**
+     * data: { [type]: { [id]: any } }
+     */
+    set: async (data) => {
+      if (!data) return;
+
+      const bulk = cKeys.initializeUnorderedBulkOp();
+
+      for (const type of Object.keys(data)) {
+        const group = data[type] || {};
+        for (const id of Object.keys(group)) {
+          const value = group[id];
+          bulk.find({ type, id }).upsert().updateOne({ $set: { type, id, value }});
+        }
+      }
+
+      if (bulk.length > 0) {
+        await bulk.execute();
+      }
+    }
+  };
+
+  // ——— واجهة بايليز الكاملة ———
+  const state = {
+    creds: await (async () => {
+      const c = await readCreds();
+      return c || {};
+    })(),
+    keys
+  };
+
+  async function saveCreds() {
+    await writeCreds(state.creds);
+  }
+
   return { state, saveCreds, clearAuth, getHasCreds };
 }
 
