@@ -1,16 +1,17 @@
 'use strict';
 
 /**
- * نقطة تشغيل الخدمة:
- * - يشغّل خادم HTTP صحي للـ Render
+ * نقطة تشغيل الخدمة (root/index.js):
+ * - يشغّل خادم HTTP الصحي
  * - يشغّل بوت تيليجرام
- * - يشغّل واتساب (وسيُعيد ربط مستمع الرسائل داخليًا عند أي إعادة اتصال)
+ * - يشغّل واتساب
+ * المسارات كلها تشير إلى داخل src/
  */
 
 const http    = require('http');
-const logger  = require('./lib/logger');
-const { startTelegram } = require('./app/telegram');
-const { startWhatsApp } = require('./app/whatsapp');
+const logger  = require('./src/lib/logger');
+const { startTelegram } = require('./src/app/telegram');
+const { startWhatsApp } = require('./src/app/whatsapp');
 
 // خادم صحي بسيط لطلبات Render
 const PORT = process.env.PORT || 10000;
@@ -29,8 +30,8 @@ http.createServer((req, res) => {
 
 (async () => {
   try {
-    const telegram = startTelegram();          // بوت تيليجرام (لإرسال QR… إلخ)
-    await startWhatsApp({ telegram });         // بوت واتساب — مستمع الرسائل يُسجل داخل startWhatsApp
+    const telegram = startTelegram();
+    await startWhatsApp({ telegram });
   } catch (e) {
     logger.error({ err: e, stack: e?.stack }, 'Fatal error in bootstrap');
     process.exit(1);
