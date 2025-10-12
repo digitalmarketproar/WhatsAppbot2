@@ -5,6 +5,7 @@
  * - قفل Singleton عبر Mongo لمنع تعدد المثيلات
  * - إرسال QR لتليجرام عند الحاجة
  * - ربط مستمع الرسائل الرسمي لكل سوكِت جديد (منع فقدان المستمع بعد إعادة الاتصال)
+ * - منع أي إرسال أثناء انقطاع الاتصال
  * - إزالة أي Echo handlers لمنع اللوب
  */
 
@@ -26,11 +27,13 @@ const { onMessageUpsert }    = require('../handlers/messages'); // المستم�
 
 const MONGO_URI        = process.env.MONGODB_URI || process.env.MONGODB_URL;
 const WA_LOCK_KEY      = process.env.WA_LOCK_KEY || 'wa_lock_singleton';
-// ⚠️ لا نستخدم ENABLE_WA_ECHO — أُزيل كليًا لتفادي اللوب
 
+// حالة الجاهزية + مرجع السوكِت
 let _lockMongoClient = null;
 let _lockHeld = false;
 let _sock = null;
+let _waReady = false;
+let _starting = false; // للحماية من بدءين متوازيين
 
 async function acquireLockOrExit() {
   if (!MONGO_URI) throw new Error('MONGODB_URI required');
@@ -49,11 +52,13 @@ async function acquireLockOrExit() {
     { $set: { holderId, ts: now } },
     { upsert: true }
   );
+
   const matched = res.matchedCount + (res.upsertedCount || 0);
   if (!matched) {
     logger.warn('Another instance holds the lock. Exiting.');
     process.exit(0);
   }
+
   _lockHeld = true;
   logger.info({ holderId, key: WA_LOCK_KEY }, '✅ Acquired/Refreshed WA singleton lock.');
 }
@@ -69,6 +74,26 @@ async function releaseLock() {
 function safeCloseSock(s) {
   try { s?.end?.(); } catch {}
   try { s?.ws?.close?.(); } catch {}
+}
+
+function isOpenSocket(s) {
+  try {
+    // جاهزيّة البايلِز تكون عندما يعلن الاتصال open
+    // وwebsocket في حالة OPEN (1)
+    return Boolean(_waReady && s && s.ws && s.ws.readyState === 1);
+  } catch { return false; }
+}
+
+/**
+ * إرسال آمن لا يشتغل إلا إذا الاتصال مفتوح
+ */
+async function safeSend(jid, content, options) {
+  if (!isOpenSocket(_sock)) {
+    const err = new Error('WA not ready');
+    err.code = 'WA_NOT_READY';
+    throw err;
+  }
+  return _sock.sendMessage(jid, content, options);
 }
 
 async function createSocket({ telegram }) {
@@ -115,6 +140,7 @@ async function createSocket({ telegram }) {
             try { await clearAuth(); } catch {}
             try { safeCloseSock(sock); } catch {}
             _sock = null;
+            _waReady = false;
             startWhatsApp({ telegram });
           }
         }, 60_000);
@@ -130,6 +156,7 @@ async function createSocket({ telegram }) {
             try { await clearAuth(); } catch {}
             try { safeCloseSock(sock); } catch {}
             _sock = null;
+            _waReady = false;
             startWhatsApp({ telegram });
           }
         }, 60_000);
@@ -138,12 +165,14 @@ async function createSocket({ telegram }) {
 
     if (connection === 'open') {
       logger.info('connected to WA');
+      _waReady = true;
       awaitingPairing = false;
       if (restartTimer) { clearTimeout(restartTimer); restartTimer = null; }
       if (qrRotateTimer) { clearTimeout(qrRotateTimer); qrRotateTimer = null; }
     }
 
     if (connection === 'close') {
+      _waReady = false;
       const code =
         (lastDisconnect?.error && (lastDisconnect.error.output?.statusCode || lastDisconnect.error?.status)) || 0;
       logger.info({ code }, 'WA connection.close');
@@ -151,8 +180,8 @@ async function createSocket({ telegram }) {
       try { safeCloseSock(sock); } catch {}
       _sock = null;
 
+      // 440/515/… حالات استبدال/إعادة تفاوض شائعة
       if (code === 515) {
-        // إعادة تشغيل تيار بدون مسح اعتماد
         logger.warn('Stream 515 — restarting socket without clearing auth.');
         setTimeout(() => startWhatsApp({ telegram }), 3000);
         return;
@@ -175,23 +204,30 @@ async function createSocket({ telegram }) {
     }
   });
 
-  // 🔴 مهم: ربط مستمع الرسائل الرسمي هنا على هذا السوكِت (ويُعاد تلقائيًا مع أي سوكِت جديد)
-  try {
-    sock.ev.removeAllListeners('messages.upsert'); // احترازي لمنع التكرار
-  } catch {}
-  sock.ev.on('messages.upsert', onMessageUpsert(sock));
+  // ربط مستمع الرسائل الرسمي على هذا السوكِت فقط (ومن ثم يُعاد ربطه تلقائيًا عند إنشاء سوكِت جديد)
+  try { sock.ev.removeAllListeners('messages.upsert'); } catch {}
+  sock.ev.on('messages.upsert', onMessageUpsert(sock, { isOpenSocket, safeSend, logger: logger }));
 
   return sock;
 }
 
 async function startWhatsApp({ telegram } = {}) {
+  if (_starting) return _sock;
+  _starting = true;
+
   await acquireLockOrExit();
 
-  if (_sock) return _sock;
+  if (_sock) {
+    _starting = false;
+    return _sock;
+  }
+
+  _waReady = false;
   _sock = await createSocket({ telegram });
 
   const shutdown = () => {
     logger.warn('SIGTERM/SIGINT: closing WA socket');
+    _waReady = false;
     safeCloseSock(_sock);
     _sock = null;
     releaseLock();
@@ -199,7 +235,8 @@ async function startWhatsApp({ telegram } = {}) {
   process.once('SIGINT', shutdown);
   process.once('SIGTERM', shutdown);
 
+  _starting = false;
   return _sock;
 }
 
-module.exports = { startWhatsApp };
+module.exports = { startWhatsApp, safeSend, isOpenSocket: () => isOpenSocket(_sock) };
