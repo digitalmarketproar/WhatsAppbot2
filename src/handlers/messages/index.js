@@ -25,13 +25,13 @@ function matchExactKeyword(textNorm) {
   return matchExactKeyword._cache[textNorm] || '';
 }
 
-function pick(arr) { return Array.isArray(arr)&&arr.length ? arr[Math.floor(Math.random()*arr.length)] : ''; }
+function pick(arr) { return Array.isArray(arr)&&arr.length ? Math.floor(Math.random()*arr.length) in arr ? arr[Math.floor(Math.random()*arr.length)] : '' : ''; }
 function matchContains(textNorm) {
   for (const key of Object.keys(contains || {})) {
     const rule = contains[key];
     if (!rule || !Array.isArray(rule.any) || !Array.isArray(rule.replies)) continue;
     const found = rule.any.some(ph => textNorm.includes(normalizeArabic(ph)));
-    if (found) return pick(rule.replies) || '';
+    if (found) return (rule.replies.length ? rule.replies[Math.floor(Math.random()*rule.replies.length)] : '') || '';
   }
   return '';
 }
@@ -56,6 +56,7 @@ function extractText(m) {
   ).trim();
 }
 
+// تحقّق اسم الأمر عند أول كلمة
 function resolveCommandName(firstToken, reg) {
   if (!firstToken) return '';
   const t  = firstToken;
@@ -68,31 +69,60 @@ function resolveCommandName(firstToken, reg) {
   return '';
 }
 
-function onMessageUpsert(sock) {
+/**
+ * onMessageUpsert
+ * - يمنع الرد أثناء انقطاع الاتصال
+ * - يمنع الرد على رسائل البوت نفسه
+ * - يعتمد safeSend القادم من طبقة الواتساب
+ */
+function onMessageUpsert(sock, helpers = {}) {
+  const isOpenSocket = helpers.isOpenSocket || (() => Boolean(sock?.ws?.readyState === 1));
+  const safeSend     = helpers.safeSend     || (async (jid, content, options) => {
+    if (!isOpenSocket()) throw new Error('WA not ready');
+    return sock.sendMessage(jid, content, options);
+  });
+  const log          = helpers.logger || logger;
+
   return async ({ messages }) => {
     const reg = ensureRegistry();
 
     for (const m of (messages || [])) {
       try {
+        // حماية إضافية: لا تعمل إن لم يكن الاتصال مفتوحًا
+        if (!isOpenSocket()) continue;
+
         const chatId = m.key?.remoteJid;
         if (!chatId) continue;
-        if (m.key?.fromMe) continue;               // لا نعيد الرد على أنفسنا
+
+        // لا نرد على أنفسنا لمنع الـ echo
+        if (m.key?.fromMe) continue;
+
+        // نتجاهل status
         if (chatId === 'status@broadcast') continue;
 
-        // قائمة التجاهل
+        // قائمة التجاهل من قاعدة البيانات
         const bare = chatId.replace(/@.+$/, '');
-        const ignored = await IgnoreChat.findOne({ $or: [{ chatId }, { chatId: bare }, { bare }] }).lean().catch(() => null);
+        const ignored = await IgnoreChat.findOne({ $or: [{ chatId }, { chatId: bare }, { bare }] })
+          .lean()
+          .catch(() => null);
         if (ignored) continue;
 
-        // نص الرسالة
+        // استخراج النص
         const rawText  = extractText(m);
         const textNorm = normalizeArabic(rawText);
+        if (!rawText) {
+          // في القروبات ما زال بإمكاننا إدارة المخالفات حتى لو بدون نص
+          if (chatId.endsWith('@g.us')) {
+            await moderateGroupMessage(sock, m).catch(e => log.warn({ e }, 'moderation error (no text)'));
+          }
+          continue;
+        }
 
         // داخل القروبات:
         if (chatId.endsWith('@g.us')) {
           // أمر "id" فقط داخل القروب
           if (textNorm === 'id' || textNorm === 'المعرف') {
-            await sock.sendMessage(chatId, { text: `🆔 معرف هذا القروب:\n\`${chatId}\`` }, { quoted: m });
+            await safeSend(chatId, { text: `🆔 معرف هذا القروب:\n\`${chatId}\`` }, { quoted: m });
             continue;
           }
           // خلاف ذلك: إدارة فقط (حذف/تحذير/طرد)
@@ -101,8 +131,6 @@ function onMessageUpsert(sock) {
         }
 
         // من هنا: خاص فقط — الأوامر والقاموس
-        if (!rawText) continue;
-
         const firstWord = textNorm.split(' ')[0] || '';
         let handled = false;
 
@@ -124,22 +152,22 @@ function onMessageUpsert(sock) {
         // قاموس مطابق تمامًا
         if (!handled) {
           const r1 = matchExactKeyword(textNorm);
-          if (r1) { await sock.sendMessage(chatId, { text: r1 }, { quoted: m }); handled = true; }
+          if (r1) { await safeSend(chatId, { text: r1 }, { quoted: m }); handled = true; }
         }
 
         // contains ذكي
         if (!handled) {
           const r2 = matchContains(textNorm);
-          if (r2) { await sock.sendMessage(chatId, { text: r2 }, { quoted: m }); handled = true; }
+          if (r2) { await safeSend(chatId, { text: r2 }, { quoted: m }); handled = true; }
         }
 
         // intents عامة
         if (!handled) {
           const r3 = matchIntent(textNorm);
-          if (r3) { await sock.sendMessage(chatId, { text: r3 }, { quoted: m }); handled = true; }
+          if (r3) { await safeSend(chatId, { text: r3 }, { quoted: m }); handled = true; }
         }
       } catch (err) {
-        logger.error({ err, stack: err?.stack }, 'messages.upsert error');
+        log.error({ err: err?.message, stack: err?.stack }, 'messages.upsert error');
       }
     }
   };
