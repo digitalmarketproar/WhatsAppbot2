@@ -1,75 +1,118 @@
 // src/lib/wa-mongo-auth.js
-const mongoose = require('mongoose');
-const {
-  initAuthCreds,
-  makeCacheableSignalKeyStore,
-  BufferJSON
-} = require('@whiskeysockets/baileys');
+'use strict';
 
+const { MongoClient } = require('mongodb');
+const { initAuthCreds } = require('@whiskeysockets/baileys');
+
+const MONGO_URI = process.env.MONGODB_URI || process.env.MONGODB_URL;
 const CREDS_COL = process.env.BAILEYS_CREDS_COLLECTION || 'BaileysCreds';
 const KEYS_COL  = process.env.BAILEYS_KEY_COLLECTION  || 'BaileysKey';
 
-const credsSchema = new mongoose.Schema(
-  { _id: { type: String, default: 'creds' }, data: { type: String, required: true } },
-  { versionKey: false, collection: CREDS_COL }
-);
+let _client; // shared client
+let _db;
+let _credsCol;
+let _keysCol;
 
-const keySchema = new mongoose.Schema(
-  { type: { type: String, index: true }, id: { type: String, index: true }, value: { type: String, required: true } },
-  { versionKey: false, collection: KEYS_COL }
-);
-keySchema.index({ type: 1, id: 1 }, { unique: true });
+async function ensureMongo(logger) {
+  if (_db) return;
+  if (!_client) {
+    _client = new MongoClient(MONGO_URI, { serverSelectionTimeoutMS: 8000 });
+    await _client.connect();
+  }
+  _db = _client.db(); // default DB from URI
+  _credsCol = _db.collection(CREDS_COL);
+  _keysCol  = _db.collection(KEYS_COL);
 
-const CredsModel = mongoose.models[CREDS_COL] || mongoose.model(CREDS_COL, credsSchema);
-const KeyModel   = mongoose.models[KEYS_COL]  || mongoose.model(KEYS_COL,  keySchema);
+  // فهرس بسيط للمفاتيح
+  await _keysCol.createIndex({ _id: 1 }, { unique: true }).catch(() => {});
+}
 
-async function mongoAuthState(logger) {
-  // تحميل الـcreds من Mongo أو تهيئة جديدة
-  let stored = await CredsModel.findById('creds').lean();
-  const creds = stored?.data
-    ? JSON.parse(stored.data, BufferJSON.reviver)
-    : initAuthCreds();
+/**
+ * بايليز يتوقع:
+ *  state: { creds, keys }
+ *  keys.get({ type, ids }) -> { [id]: value | undefined }  (مهم: ليس null)
+ *  keys.set([{ type, id, value }])
+ */
+async function mongoAuthState(logger = console) {
+  await ensureMongo(logger);
 
-  const signalKeyStore = {
-    get: async (type, id) => {
-      const doc = await KeyModel.findOne({ type, id }).lean();
-      return doc?.value ? JSON.parse(doc.value, BufferJSON.reviver) : null;
+  // تحميل الاعتماد
+  let credsDoc = await _credsCol.findOne({ _id: 'creds' });
+  let creds = credsDoc?.data ? credsDoc.data : initAuthCreds();
+
+  // --- مفاتيح الإشارة ---
+  const keys = {
+    /**
+     * @param {{type: string, ids: string[]}} param0
+     * @returns {Promise<Record<string, any>>}
+     */
+    async get({ type, ids }) {
+      if (!Array.isArray(ids) || ids.length === 0) return {};
+      // مفاتيحنا مخزنة بـ _id = `${type}:${id}`
+      const queryIds = ids.map((id) => `${type}:${id}`);
+      const docs = await _keysCol
+        .find({ _id: { $in: queryIds } })
+        .project({ _id: 1, value: 1 })
+        .toArray();
+
+      const out = {};
+      // عَبِّئ الموجود
+      for (const d of docs) {
+        const [, id] = String(d._id).split(':');
+        out[id] = d.value;
+      }
+      // القيَم غير الموجودة يجب أن تبقى undefined وليس null
+      for (const id of ids) {
+        if (!(id in out)) out[id] = undefined;
+      }
+      return out; // مهم: كائن، ليس null
     },
-    set: async (type, id, value) => {
-      const v = JSON.stringify(value, BufferJSON.replacer);
-      await KeyModel.updateOne({ type, id }, { $set: { value: v } }, { upsert: true });
+
+    /**
+     * @param {{type: string, id: string, value: any}[]} data
+     */
+    async set(data) {
+      if (!Array.isArray(data) || data.length === 0) return;
+      const ops = data.map(({ type, id, value }) => ({
+        updateOne: {
+          filter: { _id: `${type}:${id}` },
+          update: { $set: { value } },
+          upsert: true,
+        },
+      }));
+      await _keysCol.bulkWrite(ops, { ordered: false });
     },
-    delete: async (type, id) => {
-      await KeyModel.deleteOne({ type, id });
+
+    // اختيارية: حذف مفاتيح محددة (نادرًا ما تُستخدم)
+    async delete({ type, ids }) {
+      if (!Array.isArray(ids) || ids.length === 0) return;
+      const delIds = ids.map((id) => `${type}:${id}`);
+      await _keysCol.deleteMany({ _id: { $in: delIds } });
     },
-    getAll: async (type) => {
-      const docs = await KeyModel.find({ type }).lean();
-      return docs.map(d => [d.id, JSON.parse(d.value, BufferJSON.reviver)]);
-    },
-    clear: async () => KeyModel.deleteMany({})
   };
 
-  const keys = makeCacheableSignalKeyStore(signalKeyStore, logger);
-
   async function saveCreds() {
-    const data = JSON.stringify(creds, BufferJSON.replacer);
-    await CredsModel.findByIdAndUpdate('creds', { data }, { upsert: true, new: true });
+    await _credsCol.updateOne(
+      { _id: 'creds' },
+      { $set: { data: creds } },
+      { upsert: true }
+    );
   }
 
   async function clearAuth() {
     await Promise.all([
-      CredsModel.deleteMany({}),
-      KeyModel.deleteMany({})
+      _credsCol.deleteMany({}),
+      _keysCol.deleteMany({}),
     ]);
   }
 
   async function getHasCreds() {
-    const c = await CredsModel.countDocuments({});
-    const k = await KeyModel.countDocuments({});
-    return (c > 0) || (k > 0);
+    const c = await _credsCol.findOne({ _id: 'creds' });
+    return !!c;
   }
 
-  return { state: { creds, keys }, saveCreds, clearAuth, getHasCreds, models: { CredsModel, KeyModel } };
+  const state = { creds, keys };
+  return { state, saveCreds, clearAuth, getHasCreds };
 }
 
 module.exports = { mongoAuthState };
