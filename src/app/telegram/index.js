@@ -2,131 +2,110 @@
 
 /**
  * Telegram Admin Bot — Webhook mode (no polling)
- * - Attaches to existing Express app if provided
- * - Or creates a tiny express server if none passed
- * - Sets webhook to PUBLIC_URL + route
+ * Loader يسجل كل ملفات modules/*.js تلقائيًا (كل ملف يصدّر دالة (ctx) => void)
  */
 
-const TelegramBot = require('node-telegram-bot-api');
-const express = require('express');
+const fs = require('fs');
+const path = require('path');
 const bodyParser = require('body-parser');
+const TelegramBot = require('node-telegram-bot-api');
 const logger = require('../../lib/logger');
 
-// ==== ENV ====
-const TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
-const PUBLIC_URL = process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '';
-const WEBHOOK_PATH = process.env.TELEGRAM_WEBHOOK_PATH || '/telegram/webhook';
-const PORT = process.env.PORT || process.env.RENDER_PORT || 10000;
+const TOKEN  = process.env.TELEGRAM_BOT_TOKEN || '';
+const ADMIN  = process.env.TELEGRAM_ADMIN_ID || ''; // اختياري — إن تُرك فارغًا، سيسمح adminOnly للجميع
+const PUBLIC = process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '';
+const HOOK   = process.env.TELEGRAM_WEBHOOK_PATH || '/telegram/webhook';
 
-// نحاول تحميل مجمّع الوحدات (router للأوامر)
-let handlers = {};
-try {
-  handlers = require('./modules'); // تأكّد من وجود src/app/telegram/modules/index.js
-} catch (_) {
-  handlers = {};
-}
+let bot = null;
 
-function wireRouter(bot) {
-  bot.on('message', async (msg) => {
+/** حمّل كل ملفات modules/*.js وسجلها */
+function registerAllModules(ctx) {
+  const dir = path.join(__dirname, 'modules');
+  if (!fs.existsSync(dir)) {
+    logger.warn('telegram/modules folder not found — no admin commands will be registered.');
+    return;
+  }
+  const files = fs.readdirSync(dir).filter(f => f.endsWith('.js'));
+  if (!files.length) logger.warn('No modules found in telegram/modules');
+  for (const f of files) {
+    const full = path.join(dir, f);
     try {
-      const chatId = msg.chat.id;
-      const text = (msg.text || '').trim();
-      if (!text) return;
-
-      if (/^\/start\b/.test(text)) {
-        await bot.sendMessage(chatId, 'بوت الإدارة (Webhook) شغال ✅\nاكتب /help لعرض الأوامر.');
-        return;
+      // تخلّص من الكاش في كل تشغيل
+      delete require.cache[require.resolve(full)];
+      const mod = require(full);
+      if (typeof mod === 'function') {
+        mod(ctx); // ← هذا أسلوبك (مثل help.js)
+        logger.info({ file: f }, 'registered telegram module');
+      } else {
+        logger.warn({ file: f }, 'telegram module does not export a function — skipped');
       }
-
-      if (/^\/help\b/.test(text)) {
-        if (handlers.handleHelp) return handlers.handleHelp({ bot, msg });
-        return bot.sendMessage(chatId, 'لا يوجد ملف help. أضف modules/help.js');
-      }
-
-      if (/^\/group\b/.test(text)) {
-        if (handlers.handleGroupCommand) return handlers.handleGroupCommand({ bot, msg });
-        return bot.sendMessage(chatId, 'لا يوجد ملف group. أضف modules/group.js');
-      }
-
-      if (/^\/ignore\b/.test(text)) {
-        if (handlers.handleIgnore) return handlers.handleIgnore({ bot, msg });
-        return bot.sendMessage(chatId, 'لا يوجد ملف ignore. أضف modules/ignore.js');
-      }
-
-      if (/^\/whitelist\b/.test(text)) {
-        if (handlers.handleWhitelist) return handlers.handleWhitelist({ bot, msg });
-        return bot.sendMessage(chatId, 'لا يوجد ملف whitelist. أضف modules/whitelist.js');
-      }
-
-      if (/^\/status\b/.test(text)) {
-        if (handlers.handleStatus) return handlers.handleStatus({ bot, msg });
-        return bot.sendMessage(chatId, 'لا يوجد ملف status. أضف modules/status.js');
-      }
-
-      if (/^\/rules\b/.test(text)) {
-        if (handlers.handleRules) return handlers.handleRules({ bot, msg });
-        return bot.sendMessage(chatId, 'لا يوجد ملف rules. أضف modules/rules.js');
-      }
-
-      if (/^\/toggles\b/.test(text)) {
-        if (handlers.handleToggles) return handlers.handleToggles({ bot, msg });
-        return bot.sendMessage(chatId, 'لا يوجد ملف toggles. أضف modules/toggles.js');
-      }
-
-      if (/^\/banwords\b/.test(text)) {
-        if (handlers.handleBanwords) return handlers.handleBanwords({ bot, msg });
-        return bot.sendMessage(chatId, 'لا يوجد ملف banwords. أضف modules/banwords.js');
-      }
-    } catch (err) {
-      logger.error({ err, stack: err?.stack }, 'telegram message handler error');
+    } catch (e) {
+      logger.error({ file: f, err: e?.message, stack: e?.stack }, 'failed to register telegram module');
     }
-  });
+  }
 }
 
-async function setWebhook(bot, baseUrl) {
-  const url = `${String(baseUrl).replace(/\/+$/,'')}${WEBHOOK_PATH}`;
-  await bot.deleteWebHook({ drop_pending_updates: true }).catch(() => {});
+async function setWebhook(url) {
+  try { await bot.deleteWebHook({ drop_pending_updates: true }); } catch {}
   await bot.setWebHook(url, { allowed_updates: ['message', 'callback_query'] });
   logger.info({ url }, '✅ Telegram webhook set');
 }
 
+function attachWebhookToApp(app) {
+  app.use(bodyParser.json());
+  app.post(HOOK, (req, res) => {
+    try {
+      bot.processUpdate(req.body);
+      res.sendStatus(200);
+    } catch (e) {
+      logger.error({ err: e?.message }, 'bot.processUpdate failed');
+      res.sendStatus(500);
+    }
+  });
+  logger.info({ path: HOOK }, '🪝 Telegram webhook attached to main Express app');
+}
+
+/**
+ * استدعِ هذه من index.js الرئيسي:
+ *    const { startTelegramBot } = require('./src/app/telegram');
+ *    const app = startExpress(); // أو عندك Express رئيسي
+ *    const bot = await startTelegramBot({ app });
+ */
 async function startTelegramBot({ app = null } = {}) {
   if (!TOKEN) {
-    // نُرجع null لكن نظل دالة لتفادي TypeError في index.js
     logger.warn('TELEGRAM_BOT_TOKEN is missing. Telegram admin bot will NOT start.');
     return null;
   }
 
-  // إنشاء البوت بدون polling
-  const bot = new TelegramBot(TOKEN, { webHook: { port: 0 } });
-  wireRouter(bot);
+  // لا Polling — نستخدم Webhook
+  bot = new TelegramBot(TOKEN, { webHook: { port: 0 } });
 
-  if (app) {
-    // وصّل الويبهوك على نفس تطبيق إكسبريس الرئيسي
-    app.use(bodyParser.json());
-    app.post(WEBHOOK_PATH, (req, res) => { bot.processUpdate(req.body); res.sendStatus(200); });
-    logger.info({ path: WEBHOOK_PATH }, '🪝 Telegram webhook attached to main Express app');
-    if (PUBLIC_URL) await setWebhook(bot, PUBLIC_URL);
-    else logger.warn('PUBLIC_URL missing — webhook not set; Telegram will not receive updates.');
-    return bot;
+  const ctx = {
+    bot,
+    adminId: ADMIN,
+    app
+  };
+
+  if (app) attachWebhookToApp(app);
+  registerAllModules(ctx);
+
+  if (PUBLIC) {
+    const url = `${PUBLIC.replace(/\/+$/, '')}${HOOK}`;
+    await setWebhook(url);
+    logger.info('🤖 Telegram bot is up (webhook attached).');
+  } else {
+    logger.warn('PUBLIC_URL is missing — webhook NOT set. Telegram bot will not receive updates.');
   }
 
-  // لا يوجد app → شغّل خادم صغير
-  const mini = express();
-  mini.use(bodyParser.json());
-  mini.post(WEBHOOK_PATH, (req, res) => { bot.processUpdate(req.body); res.sendStatus(200); });
-
-  const server = mini.listen(PORT, '0.0.0.0', async () => {
-    logger.info(`🌐 Telegram mini server listening on 0.0.0.0:${PORT}`);
-    if (PUBLIC_URL) await setWebhook(bot, PUBLIC_URL);
-    else logger.warn('PUBLIC_URL missing — webhook not set; Telegram will not receive updates.');
-  });
-
-  const shutdown = () => { try { server.close(); } catch {} };
-  process.once('SIGINT', shutdown);
-  process.once('SIGTERM', shutdown);
+  // Log عام لتشخيص
+  logger.info({
+    hasToken: !!TOKEN,
+    hasAdmin: !!ADMIN,
+    publicUrl: PUBLIC || null,
+    hook: HOOK
+  }, 'telegram config summary');
 
   return bot;
 }
 
-module.exports = { startTelegramBot, WEBHOOK_PATH };
+module.exports = { startTelegramBot };
