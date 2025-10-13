@@ -1,68 +1,88 @@
 // src/app/telegram/index.js
 const TelegramBot = require('node-telegram-bot-api');
-const QRCode = require('qrcode');
 const logger = require('../../lib/logger');
+const {
+  handleGroupCommand,
+  handleHelp,
+  handleIgnore,
+  handleWhitelist,
+  handleStatus,
+  handleRules,
+  handleToggles,
+  handleBanwords
+} = require('./modules'); // ملف جامع بسيط للموديولات (انظر الملاحظة أدناه)
 
-const registerIgnoreCommands   = require('./modules/ignore');
-const registerGroupCommands    = require('./modules/group');
-const registerRulesCommands    = require('./modules/rules');
-const registerToggleCommands   = require('./modules/toggles');
-const registerBanwordCommands  = require('./modules/banwords');
-const registerStatusCommands   = require('./modules/status');
-const registerHelpCommand      = require('./modules/help');
-
-// ✅ إضافة وحدة إدارة القائمة البيضاء
-const registerWhitelistCommands = require('./modules/whitelist');
-
-function startTelegram(token, adminId) {
-  if (!token || !adminId) return null;
-
-  const bot = new TelegramBot(token, { polling: false });
-
-  // تنظيف أي WebHook قديم ثم ابدأ polling
-  bot.deleteWebHook({ drop_pending_updates: true }).catch(() => {});
-  bot.startPolling({ restart: true, interval: 300, timeout: 30 }).catch(() => {});
-
-  async function notify(text) {
-    try {
-      await bot.sendMessage(adminId, text, { parse_mode: 'Markdown', disable_web_page_preview: true });
-    } catch (e) {
-      logger.warn({ e }, 'Telegram notify failed');
-    }
+/**
+ * نرجّع كائن فيه دوال يستعملها واتساب لإرسال QR (sendPhoto/sendQR)
+ * وكذلك نبدأ بولينغ البوت ونربط أوامر الأدمن.
+ *
+ * ENV المطلوب:
+ * - TELEGRAM_BOT_TOKEN (إجباري)
+ * - TELEGRAM_ADMIN_ID  (اختياري - للتنبيه/إرسال QR لنفس الأدمن)
+ * - TELEGRAM_QR_CHAT_ID (اختياري - لو حاب ترسل QR لقناة/جروب معيّن)
+ */
+function startTelegram() {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  if (!token) {
+    logger.warn('TELEGRAM_BOT_TOKEN missing — Telegram admin bot will NOT start.');
+    // واجهة صورية حتى لا تتعطل whatsapp.js
+    return {
+      sendPhoto: async () => {},
+      sendQR: async () => {}
+    };
   }
 
-  async function sendQR(qrString) {
+  const bot = new TelegramBot(token, { polling: true });
+  logger.info('🤖 Telegram bot started (admin commands ready).');
+
+  const ADMIN_ID = process.env.TELEGRAM_ADMIN_ID;
+  const QR_CHAT  = process.env.TELEGRAM_QR_CHAT_ID || ADMIN_ID;
+
+  // أوامر بسيطة
+  bot.onText(/^\/start$/i, (msg) => bot.sendMessage(msg.chat.id, 'مرحبا! بوت الإدارة شغّال ✅'));
+  bot.onText(/^\/ping$/i,  (msg) => bot.sendMessage(msg.chat.id, 'pong ✅'));
+
+  // ربط موديولات الأدمن (إن وجدت)
+  bot.on('message', async (msg) => {
     try {
-      const buf = await QRCode.toBuffer(qrString, { type: 'png', margin: 1, scale: 6 });
-      await bot.sendPhoto(adminId, buf, { caption: '📱 QR لتسجيل الدخول إلى واتساب' });
-    } catch (e) {
-      logger.warn({ e }, 'Telegram sendQR failed');
-      await notify('QR: ' + qrString);
+      if (!msg.text) return;
+      const text = msg.text.trim();
+
+      if (/^\/help\b/i.test(text))   return handleHelp(bot, msg);
+      if (/^\/status\b/i.test(text)) return handleStatus(bot, msg);
+      if (/^\/rules\b/i.test(text))  return handleRules(bot, msg);
+
+      if (/^\/group\b/i.test(text))     return handleGroupCommand(bot, msg);
+      if (/^\/ignore\b/i.test(text))    return handleIgnore(bot, msg);
+      if (/^\/whitelist\b/i.test(text)) return handleWhitelist(bot, msg);
+      if (/^\/toggles\b/i.test(text))   return handleToggles(bot, msg);
+      if (/^\/banwords\b/i.test(text))  return handleBanwords(bot, msg);
+    } catch (err) {
+      logger.error({ err, stack: err?.stack }, 'telegram message error');
     }
-  }
-
-  const ctx = { bot, adminId };
-
-  // تسجيل الأوامر (مرتبة)
-  registerHelpCommand(ctx);
-  registerIgnoreCommands(ctx);
-  registerGroupCommands(ctx);
-  registerRulesCommands(ctx);
-  registerToggleCommands(ctx);
-  registerBanwordCommands(ctx);
-  registerStatusCommands(ctx);
-
-  // ✅ أوامر القائمة البيضاء
-  registerWhitelistCommands(ctx);
-
-  bot.on('polling_error', (err) => {
-    if (String(err?.message || '').includes('409')) return; // WebHook conflict
-    logger.warn({ err }, 'Telegram polling error');
   });
 
-  logger.info('🤖 Telegram bot started (admin commands ready).');
-  notify('🤖 Telegram bot started (admin commands ready).').catch(() => {});
-  return { bot, notify, sendQR };
+  // واجهة يستخدمها whatsapp.js لإرسال الـ QR
+  const api = {
+    async sendPhoto(bufOrPath, opts = {}) {
+      if (!QR_CHAT) return;
+      try {
+        await bot.sendPhoto(QR_CHAT, bufOrPath, { caption: opts.caption || '' });
+      } catch (e) {
+        logger.warn({ e: e?.message }, 'failed to sendPhoto to Telegram');
+      }
+    },
+    async sendQR(qrText) {
+      if (!QR_CHAT) return;
+      try {
+        await bot.sendMessage(QR_CHAT, 'WhatsApp QR (text fallback):\n' + '```' + qrText + '```', { parse_mode: 'Markdown' });
+      } catch (e) {
+        logger.warn({ e: e?.message }, 'failed to sendQR text to Telegram');
+      }
+    }
+  };
+
+  return api;
 }
 
 module.exports = { startTelegram };
