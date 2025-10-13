@@ -1,36 +1,46 @@
 'use strict';
 
 /**
- * نقطة تشغيل الخدمة:
- * - يشغّل خادم HTTP الصحي (Express)
- * - يشغّل بوت تيليجرام (Webhook) إن وُجد التوكن
- * - يشغّل واتساب ويمرّر له كائن telegram لإرسال QR
+ * Bootstrap:
+ * - يبدأ خادم Express الرئيسي (صحة + صفحة رئيسية)
+ * - يربط بوت تيليجرام بوضع Webhook على نفس الـ Express (إن وُجد التوكن)
+ * - يشغّل واتساب ويمرّر كائن تيليجرام لارسال QR تلقائيًا
  */
 
 const logger = require('./src/lib/logger');
 const { startExpress } = require('./src/app/express');
-const { startTelegram } = require('./src/app/telegram');
-const { startWhatsApp } = require('./src/app/whatsapp');
+const { startTelegramBot } = require('./src/app/telegram');    // يصدر startTelegramBot({ app })
+const { startWhatsApp } = require('./src/app/whatsapp');       // يصدر startWhatsApp({ telegram })
+
+// سجّل الأخطاء غير الممسوكة
+process.on('unhandledRejection', (err) => {
+  try { logger.error({ err, stack: err?.stack }, 'unhandledRejection'); } catch {}
+});
+process.on('uncaughtException', (err) => {
+  try { logger.error({ err, stack: err?.stack }, 'uncaughtException'); } catch {}
+});
 
 (async () => {
   try {
-    // 1) شغّل إكسبرس على PORT الخاص بـ Render
+    // 1) شغّل Express (يستمع على process.env.PORT و 0.0.0.0)
     const app = startExpress();
 
-    // 2) شغّل تيليجرام (ويبهوك) - قد يرجع null لو مافي توكن
-    const telegram = await startTelegram({ app });
-    if (!telegram) {
-      logger.warn('Telegram bot did NOT start (no TELEGRAM_BOT_TOKEN or PUBLIC_URL).');
-    } else {
+    // 2) شغّل تيليجرام (Webhook) لو التوكن متوفر
+    let telegram = null;
+    if (process.env.TELEGRAM_BOT_TOKEN) {
+      // يربط مسار الويبهوك على نفس app ويضبط الويبهوك إلى PUBLIC_URL
+      telegram = await startTelegramBot({ app });
       logger.info('🤖 Telegram bot is up (webhook attached).');
+    } else {
+      logger.warn('TELEGRAM_BOT_TOKEN missing — Telegram admin bot will NOT start.');
     }
 
-    // 3) شغّل واتساب ومرر له كائن تيليجرام (قد يكون null)
+    // 3) شغّل واتساب ومرّر كائن تيليجرام (قد يكون null)
     await startWhatsApp({ telegram });
 
-    logger.info('🚀 Service bootstrapped: WhatsApp started; Telegram ' + (telegram ? 'up' : 'not running'));
-  } catch (e) {
-    logger.error({ err: e, stack: e?.stack }, 'Fatal error in bootstrap');
+    logger.info('🚀 Both Telegram and WhatsApp initializers executed.');
+  } catch (err) {
+    logger.error({ err, stack: err?.stack }, 'Fatal error during bootstrap');
     process.exit(1);
   }
 })();
