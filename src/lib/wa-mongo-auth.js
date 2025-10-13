@@ -1,160 +1,160 @@
 'use strict';
 
 /**
- * Baileys Mongo Auth State
- * -----------------------
- * يخزن الـ creds والـ keys داخل MongoDB بطريقة آمنة مع كاش بالذاكرة،
- * ويُعيد دوال saveCreds / clearAuth لاستخدامها مع socket.ev.
+ * Mongo-backed Baileys auth state with proper Buffer serialization
+ * - Uses BufferJSON replacer/reviver so keys/creds stay valid
+ * - Initializes creds via initAuthCreds() on first run
+ * - Stores keys per type in BaileysKeys, and creds in BaileysCreds
  */
 
 const { MongoClient } = require('mongodb');
+const {
+  initAuthCreds,
+  BufferJSON,
+} = require('@whiskeysockets/baileys');
 
-// ====== اتصال واحد مُعاد استخدامه (Singleton) ======
-let _globalMongoClient = null;
-async function getMongoClient(uri) {
-  if (_globalMongoClient && _globalMongoClient.topology?.isConnected?.()) {
-    return _globalMongoClient;
-  }
-  _globalMongoClient = new MongoClient(uri, {
-    maxPoolSize: Number(process.env.MAX_POOL_SIZE || 5),
-    serverSelectionTimeoutMS: 8000,
-  });
-  await _globalMongoClient.connect();
-  return _globalMongoClient;
+const MONGO_URI = process.env.MONGODB_URI || process.env.MONGODB_URL;
+if (!MONGO_URI) {
+  throw new Error('MONGODB_URI is required for wa-mongo-auth');
 }
 
-// إغلاق نظيف عند الإنهاء
-function wireProcessCleanup() {
-  if (wireProcessCleanup._wired) return;
-  wireProcessCleanup._wired = true;
-  const close = async () => {
-    try { await _globalMongoClient?.close?.(); } catch {}
-    process.exit(0);
-  };
-  process.once('SIGINT', close);
-  process.once('SIGTERM', close);
-}
+// وثّق أسماء المجموعات هنا لتوحيدها
+const CREDS_COL = process.env.WA_CREDS_COLLECTION || 'BaileysCreds';
+const KEYS_COL  = process.env.WA_KEYS_COLLECTION  || 'BaileysKeys';
+
+// المفتاح الوحيد لمحفظة هذا التطبيق (يمكنك تغييره لو أردت دعم تعدد الأجهزة)
+const CREDS_DOC_ID = process.env.WA_CREDS_ID || 'default';
+
+// الأنواع المعروفة في Baileys (لا بأس بإضافة/حذف حسب النسخة)
+const VALID_KEY_TYPES = new Set([
+  'pre-key',
+  'session',
+  'sender-key',
+  'app-state-sync-key',
+  'app-state-sync-version',
+  'sender-key-memory',
+  'adv-secret-key',
+  'account',
+  'app-state-sync-key-data',
+  'app-state-sync-key-share',
+  'sender-key-retry',
+]);
 
 /**
  * mongoAuthState(logger?)
- *  - يعيد { state, saveCreds, clearAuth }
- *  - state: { creds, keys: { get, set } } لاستخدامه مع makeWASocket
+ * يعيد { state, saveCreds, clearAuth }
  */
 async function mongoAuthState(logger = console) {
-  const MONGO_URI = process.env.MONGODB_URI || process.env.MONGODB_URL;
-  if (!MONGO_URI) {
-    throw new Error('MONGODB_URI is required for mongoAuthState');
-  }
+  // اتّصال خفيف لتجنّب Alert الحد الأقصى للاتصالات على M0
+  const client = new MongoClient(MONGO_URI, {
+    maxPoolSize: 3,
+    minPoolSize: 0,
+    serverSelectionTimeoutMS: 8000,
+  });
+  await client.connect();
 
-  wireProcessCleanup();
-  const client = await getMongoClient(MONGO_URI);
-  const db = client.db(); // الافتراضي من الـ URI
-  const credsCol = db.collection('BaileysCreds');
-  const keysCol  = db.collection('BaileysKeys');
+  const db        = client.db();
+  const credsCol  = db.collection(CREDS_COL);
+  const keysCol   = db.collection(KEYS_COL);
 
-  // *** تحميل الـ creds من DB أو إنشاء مستند جديد ***
-  const CREDS_ID = 'creds';
-  let credsDoc = await credsCol.findOne({ _id: CREDS_ID });
-  if (!credsDoc) {
-    // بنية creds فارغة؛ Baileys سيملؤها عند أول QR
-    credsDoc = { _id: CREDS_ID, data: {} };
-    await credsCol.insertOne(credsDoc);
-    logger.info('Initialized fresh Baileys creds in MongoDB.');
-  }
+  // تحميل/تهيئة creds
+  let credsDoc = await credsCol.findOne({ _id: CREDS_DOC_ID });
+  let creds    = credsDoc?.data
+    ? JSON.parse(JSON.stringify(credsDoc.data), BufferJSON.reviver)
+    : initAuthCreds(); // ← مهم
 
-  // كاش بالذاكرة لتقليل القراءة من DB
-  let _creds = credsDoc.data || {};
-  const _keysCache = new Map();
-
-  // *** واجهة keys لـ Baileys ***
-  const keys = {
+  // مُخزن مفاتيح كسول — نحفظ/نقرأ حسب الطلب
+  const keyStore = {
     /**
-     * get(type, ids)
-     *  - يعيد كائن بالـ ids المطلوبة
+     * get(type, ids[])
+     * يعيد كائنًا { id: value } لكل id موجود
      */
-    get: async (type, ids) => {
+    async get(type, ids) {
       const out = {};
-      const toFetch = [];
-      for (const id of ids) {
-        const keyName = `${type}:${id}`;
-        if (_keysCache.has(keyName)) {
-          out[id] = _keysCache.get(keyName);
-        } else {
-          toFetch.push({ _id: keyName });
-        }
-      }
+      if (!ids || ids.length === 0) return out;
+      if (!VALID_KEY_TYPES.has(type)) return out;
 
-      if (toFetch.length) {
-        const found = await keysCol.find({ $or: toFetch }).toArray();
-        for (const doc of found) {
-          const [t, id] = String(doc._id).split(':');
-          out[id] = doc.data;
-          _keysCache.set(doc._id, doc.data);
-        }
+      const docs = await keysCol
+        .find({ type, id: { $in: ids.map(String) } })
+        .toArray();
+
+      for (const d of docs) {
+        // استعادة Buffer
+        out[d.id] = d.value ? JSON.parse(JSON.stringify(d.value), BufferJSON.reviver) : null;
       }
       return out;
     },
 
     /**
      * set(data)
-     *  - data: { [type]: { [id]: value } }
+     * data: { [type]: { [id]: value } }
      */
-    set: async (data) => {
+    async set(data) {
       const bulk = keysCol.initializeUnorderedBulkOp();
       let hasOps = false;
 
       for (const type of Object.keys(data || {})) {
-        const entries = data[type];
-        for (const id of Object.keys(entries || {})) {
-          const keyName = `${type}:${id}`;
+        if (!VALID_KEY_TYPES.has(type)) continue;
+        const entries = data[type] || {};
+        for (const id of Object.keys(entries)) {
           const value = entries[id];
 
-          if (value == null) {
-            // احذف المفتاح
-            bulk.find({ _id: keyName }).delete();
-            _keysCache.delete(keyName);
+          // حذف المفتاح لو null، غير ذلك حدّث/أدرج
+          if (value === null || typeof value === 'undefined') {
+            bulk.find({ type, id: String(id) }).deleteOne();
+            hasOps = true;
           } else {
-            bulk.find({ _id: keyName }).upsert().updateOne({ $set: { data: value } });
-            _keysCache.set(keyName, value);
+            const serialized = JSON.parse(
+              JSON.stringify(value, BufferJSON.replacer)
+            );
+            bulk
+              .find({ type, id: String(id) })
+              .upsert()
+              .updateOne({ $set: { type, id: String(id), value: serialized } });
+            hasOps = true;
           }
-          hasOps = true;
         }
       }
 
-      if (hasOps) await bulk.execute().catch(() => {});
+      if (hasOps) await bulk.execute();
     },
   };
 
-  // *** دالة حفظ الـ creds ***
+  // حفظ الكريدنز
   async function saveCreds() {
+    const serialized = JSON.parse(JSON.stringify(creds, BufferJSON.replacer));
     await credsCol.updateOne(
-      { _id: CREDS_ID },
-      { $set: { data: _creds } },
+      { _id: CREDS_DOC_ID },
+      { $set: { _id: CREDS_DOC_ID, data: serialized, ts: Date.now() } },
       { upsert: true }
     );
   }
 
-  // *** دالة مسح الجلسة كاملة (creds + keys) ***
+  // مسح كل شيء لإجبار QR جديد
   async function clearAuth() {
-    try {
-      await credsCol.deleteOne({ _id: CREDS_ID });
-      await keysCol.deleteMany({}); // امسح كلّ المفاتيح
-      _creds = {};
-      _keysCache.clear();
-      logger.warn('Auth wiped: BaileysCreds + BaileysKeys cleared.');
-    } catch (e) {
-      logger.error({ e: e?.message }, 'Failed to clear auth');
-    }
+    await credsCol.deleteOne({ _id: CREDS_DOC_ID }).catch(() => {});
+    await keysCol.deleteMany({}).catch(() => {});
+    // إعادة تعيين الذاكرة
+    creds = initAuthCreds();
+    logger.warn('Auth collections cleared. Next connect will require QR.');
   }
 
+  // واجهة Baileys الرسمية
+  const state = {
+    creds,
+    keys: keyStore,
+  };
+
+  // إرجاع أدوات الحفظ/المسح مع state
   return {
-    state: {
-      creds: _creds,
-      keys,
-    },
+    state,
     saveCreds,
     clearAuth,
+    // اختياري: وسيلة إغلاق اتصال Mongo نظيفًا عند الخروج
+    close: async () => {
+      try { await client.close(); } catch {}
+    },
   };
 }
 
-module.exports = { mongoAuthState, getMongoClient };
+module.exports = { mongoAuthState };
