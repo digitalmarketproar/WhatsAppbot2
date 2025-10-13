@@ -22,76 +22,81 @@ const { registerSelfHeal } = require('../lib/selfheal');
 const { onMessageUpsert }  = require('../handlers/messages');
 
 const MONGO_URI   = process.env.MONGODB_URI || process.env.MONGODB_URL;
-const WA_LOCK_KEY = process.env.WA_LOCK_KEY || 'wa_lock_singleton';
+const WA_LOCK_KEY =
+  process.env.WA_LOCK_KEY ||
+  `wa_lock_${process.env.RENDER_SERVICE_ID || process.env.PHONE_NUMBER || 'singleton'}`;
 
 let _lockMongoClient = null;
 let _lockHeld = false;
 let _lockHeartbeat = null;
 let _sock = null;
 let _starting = false;
-let _holderId = null;
 
 async function acquireLockOrExit() {
   if (!MONGO_URI) throw new Error('MONGODB_URI required');
 
-  _holderId = process.env.RENDER_INSTANCE_ID || process.env.HOSTNAME || String(process.pid);
+  const holderId = process.env.RENDER_INSTANCE_ID || process.env.HOSTNAME || String(process.pid);
   _lockMongoClient = new MongoClient(MONGO_URI, { serverSelectionTimeoutMS: 8000 });
   await _lockMongoClient.connect();
   const col = _lockMongoClient.db().collection('locks');
 
-  const now = Date.now();
-  const STALE_MS = 3 * 60 * 1000; // 3 دقائق
+  const STALE_MS = 90_000; // صلاحية القفل 90 ثانية
+  const start = Date.now();
 
-  // 1) جرّب تحديث القفل إن كان لنا أو قديم — بدون upsert (لتجنب E11000)
-  const cond = {
-    _id: WA_LOCK_KEY,
-    $or: [
-      { holderId: _holderId },
-      { ts: { $lt: now - STALE_MS } },
-      { holderId: { $exists: false } }
-    ]
-  };
+  while (true) {
+    const now = Date.now();
+    const filter = {
+      _id: WA_LOCK_KEY,
+      $or: [
+        { holderId },                       // أنا المالك الحالي
+        { ts: { $lt: now - STALE_MS } },    // قفل منتهي الصلاحية
+        { holderId: { $exists: false } }    // لا يوجد مالك
+      ]
+    };
+    const update = { $set: { holderId, ts: now } };
+    const opts   = { upsert: true, returnDocument: 'after' };
 
-  const res = await col.updateOne(cond, { $set: { holderId: _holderId, ts: now } });
-  if (res.matchedCount === 1) {
-    _lockHeld = true;
-    logger.info({ holderId: _holderId, key: WA_LOCK_KEY }, '✅ Acquired / refreshed WA singleton lock.');
-  } else {
-    // 2) لا يوجد تطابق — افحص القفل الحالي
-    const doc = await col.findOne({ _id: WA_LOCK_KEY });
-    if (doc && doc.holderId && doc.ts && doc.ts >= now - STALE_MS && doc.holderId !== _holderId) {
-      // قفل نشط لشخص آخر — اخرج بهدوء
-      logger.warn({ currentHolder: doc.holderId }, 'Another instance holds the WA lock. Exiting.');
-      process.exit(0);
-    }
-
-    // 3) إمّا القفل غير موجود، أو قديم — خذه بـ upsert لكن بدون $or لتفادي E11000
-    await col.updateOne(
-      { _id: WA_LOCK_KEY },
-      { $set: { holderId: _holderId, ts: now } },
-      { upsert: true }
-    );
-
-    _lockHeld = true;
-    logger.info({ holderId: _holderId, key: WA_LOCK_KEY }, '✅ Acquired / refreshed WA singleton lock.');
-  }
-
-  // heartbeat لتحديث الطابع الزمني
-  if (_lockHeartbeat) clearInterval(_lockHeartbeat);
-  _lockHeartbeat = setInterval(async () => {
     try {
-      await col.updateOne({ _id: WA_LOCK_KEY, holderId: _holderId }, { $set: { ts: Date.now() } });
+      const out = await col.findOneAndUpdate(filter, update, opts);
+      if (out && out.value && out.value.holderId === holderId) {
+        _lockHeld = true;
+        logger.info({ holderId, key: WA_LOCK_KEY }, '✅ Acquired / refreshed WA singleton lock.');
+        // نبضة تحديث القفل كل 30 ثانية
+        if (_lockHeartbeat) clearInterval(_lockHeartbeat);
+        _lockHeartbeat = setInterval(async () => {
+          try { await col.updateOne({ _id: WA_LOCK_KEY }, { $set: { ts: Date.now() } }); } catch {}
+        }, 30_000);
+        return;
+      }
+
+      // لم نحصل على القفل — انتظر وحاول مجددًا
+      logger.warn(
+        { currentHolder: out?.value?.holderId },
+        'Another instance holds the WA lock. Will retry in 20s.'
+      );
+      await new Promise(r => setTimeout(r, 20_000));
     } catch (e) {
-      logger.warn({ e: e?.message }, 'lock heartbeat failed');
+      // يحل E11000 الناجم عن سباق upsert
+      if (e?.code === 11000) {
+        await new Promise(r => setTimeout(r, 2_000));
+        continue;
+      }
+      throw e;
     }
-  }, 30_000);
+
+    // حماية: لو طال الانتظار كثيرًا
+    if (Date.now() - start > 5 * 60_000) {
+      logger.error('Could not obtain WA lock after 5 minutes, exiting.');
+      process.exit(1);
+    }
+  }
 }
 
 async function releaseLock() {
   try {
     if (_lockHeartbeat) { clearInterval(_lockHeartbeat); _lockHeartbeat = null; }
     if (_lockHeld) {
-      await _lockMongoClient?.db()?.collection('locks')?.deleteOne?.({ _id: WA_LOCK_KEY, holderId: _holderId });
+      await _lockMongoClient?.db()?.collection('locks')?.deleteOne?.({ _id: WA_LOCK_KEY });
       _lockHeld = false;
     }
   } catch {}
@@ -175,23 +180,27 @@ async function createSocket({ telegram }) {
     if (connection === 'close') {
       const code =
         (lastDisconnect?.error && (lastDisconnect.error.output?.statusCode || lastDisconnect.error?.status)) || 0;
-      logger.warn({ code }, '⚠️ WA connection closed.');
-
-      try { safeCloseSock(sock); } catch {}
-      _sock = null;
 
       if (code === 440) {
         logger.warn('Stream conflict detected — delaying reconnect 20s.');
+        try { safeCloseSock(sock); } catch {}
+        _sock = null;
         setTimeout(() => startWhatsApp({ telegram }), 20_000);
         return;
       }
+
+      logger.warn({ code }, '⚠️ WA connection closed.');
+      try { safeCloseSock(sock); } catch {}
+      _sock = null;
+
       if (code === 515) {
         logger.warn('Stream 515 — restarting socket without clearing auth.');
-        setTimeout(() => startWhatsApp({ telegram }), 3000);
+        setTimeout(() => startWhatsApp({ telegram }), 3_000);
         return;
       }
+
       if (code === DisconnectReason.loggedOut || code === 401) {
-        logger.warn('WA logged out — wiping. Waiting 90s for QR scan before restart.');
+        logger.warn('WA logged out — wiping. Waiting 90s to allow QR scan before restart.');
         await clearAuth();
         if (restartTimer) clearTimeout(restartTimer);
         restartTimer = setTimeout(() => {
@@ -199,7 +208,8 @@ async function createSocket({ telegram }) {
         }, 90_000);
         return;
       }
-      setTimeout(() => startWhatsApp({ telegram }), 3000);
+
+      setTimeout(() => startWhatsApp({ telegram }), 3_000);
     }
   });
 
@@ -216,6 +226,7 @@ async function startWhatsApp({ telegram } = {}) {
   try {
     await acquireLockOrExit();
     if (_sock) return _sock;
+
     _sock = await createSocket({ telegram });
 
     const shutdown = () => {
@@ -226,6 +237,7 @@ async function startWhatsApp({ telegram } = {}) {
     };
     process.once('SIGINT', shutdown);
     process.once('SIGTERM', shutdown);
+
     return _sock;
   } finally {
     _starting = false;
