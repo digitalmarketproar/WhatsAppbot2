@@ -1,10 +1,11 @@
 'use strict';
 
 /**
- * WA socket with Mongo session + singleton lock + safe reconnects
- * - Prevent multiple sockets
- * - Delay on 440 conflict
- * - One messages.upsert handler bound per socket
+ * WhatsApp socket manager with Mongo session, singleton lock & safe reconnects
+ * - Prevent multiple instances (Render-safe)
+ * - Handles stream conflict (440) with delay
+ * - Cleans up gracefully on SIGTERM
+ * - Binds only one messages.upsert handler per socket
  */
 
 const {
@@ -30,6 +31,7 @@ let _lockHeartbeat = null;
 let _sock = null;
 let _starting = false;
 
+// ---------------- LOCK SYSTEM ----------------
 async function acquireLockOrExit() {
   if (!MONGO_URI) throw new Error('MONGODB_URI required');
 
@@ -39,7 +41,7 @@ async function acquireLockOrExit() {
   const col = _lockMongoClient.db().collection('locks');
 
   const now = Date.now();
-  const STALE_MS = 3 * 60 * 1000;
+  const STALE_MS = 3 * 60 * 1000; // 3 minutes
 
   const res = await col.updateOne(
     { _id: WA_LOCK_KEY, $or: [{ holderId }, { ts: { $lt: now - STALE_MS } }, { holderId: { $exists: false } }] },
@@ -47,21 +49,20 @@ async function acquireLockOrExit() {
     { upsert: true }
   );
 
-  const matched = res.matchedCount + (res.upsertedCount || 0);
-  if (!matched) {
-    logger.warn('Another instance holds the WA lock. Exiting.');
+  if (!res.matchedCount && !res.upsertedCount) {
+    logger.warn('Another instance already holds WA lock. Exiting to avoid duplicate socket.');
     process.exit(0);
   }
-  _lockHeld = true;
-  logger.info({ holderId, key: WA_LOCK_KEY }, '✅ Acquired/Refreshed WA singleton lock.');
 
-  // heartbeat to keep lock fresh
+  _lockHeld = true;
+  logger.info({ holderId, key: WA_LOCK_KEY }, '✅ Acquired / refreshed WA singleton lock.');
+
   if (_lockHeartbeat) clearInterval(_lockHeartbeat);
   _lockHeartbeat = setInterval(async () => {
     try {
       await col.updateOne({ _id: WA_LOCK_KEY }, { $set: { ts: Date.now() } });
     } catch (e) {
-      logger.warn({ e: e?.message }, 'lock heartbeat failed');
+      logger.warn({ e: e?.message }, 'Lock heartbeat failed.');
     }
   }, 30_000);
 }
@@ -72,15 +73,20 @@ async function releaseLock() {
     if (_lockHeld) {
       await _lockMongoClient?.db()?.collection('locks')?.deleteOne?.({ _id: WA_LOCK_KEY });
       _lockHeld = false;
+      logger.info('Released MongoDB singleton lock.');
     }
-  } catch {}
+  } catch (e) {
+    logger.warn({ e: e?.message }, 'Failed to release lock cleanly.');
+  }
 }
 
+// ---------------- SOCKET HELPERS ----------------
 function safeCloseSock(s) {
   try { s?.end?.(); } catch {}
   try { s?.ws?.close?.(); } catch {}
 }
 
+// ---------------- MAIN SOCKET CREATION ----------------
 async function createSocket({ telegram }) {
   const { version } = await fetchLatestBaileysVersion();
   const { state, saveCreds, clearAuth } = await mongoAuthState(logger);
@@ -100,8 +106,8 @@ async function createSocket({ telegram }) {
   registerSelfHeal(sock, logger);
 
   let awaitingPairing = false;
-  let restartTimer = null;
   let qrRotateTimer = null;
+  let reconnectTimer = null;
 
   sock.ev.on('connection.update', async (u) => {
     const { connection, lastDisconnect, qr } = u;
@@ -110,105 +116,99 @@ async function createSocket({ telegram }) {
       try {
         const png = await QRCode.toBuffer(qr, { width: 360, margin: 1 });
         if (telegram?.sendPhoto) {
-          await telegram.sendPhoto(png, { caption: 'Scan this WhatsApp QR within 1 minute' });
+          await telegram.sendPhoto(png, { caption: '📱 Scan this WhatsApp QR within 1 minute' });
         } else if (telegram?.sendQR) {
           await telegram.sendQR(qr);
         }
         awaitingPairing = true;
-
         if (qrRotateTimer) clearTimeout(qrRotateTimer);
         qrRotateTimer = setTimeout(async () => {
           if (awaitingPairing) {
-            logger.warn('QR expired — rotating for a fresh one.');
-            try { await clearAuth(); } catch {}
-            try { safeCloseSock(sock); } catch {}
+            logger.warn('QR expired — rotating.');
+            await clearAuth().catch(() => {});
+            safeCloseSock(sock);
             _sock = null;
             startWhatsApp({ telegram });
           }
         }, 60_000);
-      } catch (e) {
-        logger.warn({ e: e.message }, 'Failed to render/send QR; sending raw text as fallback.');
-        try { await telegram?.sendQR?.(qr); } catch {}
-        awaitingPairing = true;
-
-        if (qrRotateTimer) clearTimeout(qrRotateTimer);
-        qrRotateTimer = setTimeout(async () => {
-          if (awaitingPairing) {
-            logger.warn('QR expired — rotating after fallback text.');
-            try { await clearAuth(); } catch {}
-            try { safeCloseSock(sock); } catch {}
-            _sock = null;
-            startWhatsApp({ telegram });
-          }
-        }, 60_000);
+      } catch (err) {
+        logger.warn({ err: err.message }, 'QR send failed.');
       }
     }
 
     if (connection === 'open') {
-      logger.info('connected to WA');
+      logger.info('✅ WhatsApp connected.');
       awaitingPairing = false;
-      if (restartTimer) { clearTimeout(restartTimer); restartTimer = null; }
-      if (qrRotateTimer) { clearTimeout(qrRotateTimer); qrRotateTimer = null; }
+      if (qrRotateTimer) clearTimeout(qrRotateTimer);
     }
 
     if (connection === 'close') {
-      const code =
-        (lastDisconnect?.error && (lastDisconnect.error.output?.statusCode || lastDisconnect.error?.status)) || 0;
-      logger.info({ code }, 'WA connection.close');
+      const code = lastDisconnect?.error?.output?.statusCode || lastDisconnect?.error?.status || 0;
+      logger.warn({ code }, '⚠️ WA connection closed.');
 
-      try { safeCloseSock(sock); } catch {}
+      safeCloseSock(sock);
       _sock = null;
 
-      // 440 = replaced (conflict)
-      if (code === 440) {
-        logger.warn('Stream conflict (replaced). Delaying reconnect to avoid race.');
-        setTimeout(() => startWhatsApp({ telegram }), 10_000);
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+
+      // --- conflict (duplicate socket)
+      if (code === 440 || /conflict/i.test(lastDisconnect?.error?.message || '')) {
+        logger.warn('Stream conflict detected — delaying reconnect 20s.');
+        reconnectTimer = setTimeout(() => startWhatsApp({ telegram }), 20_000);
         return;
       }
 
+      // --- temporary 515 error
       if (code === 515) {
-        logger.warn('Stream 515 — restarting socket without clearing auth.');
-        setTimeout(() => startWhatsApp({ telegram }), 3000);
+        logger.warn('Stream 515 — restarting socket (no auth clear).');
+        reconnectTimer = setTimeout(() => startWhatsApp({ telegram }), 5_000);
         return;
       }
 
+      // --- logged out
       if (code === DisconnectReason.loggedOut || code === 401) {
-        logger.warn('WA logged out — wiping. Waiting 90s to allow QR scan before restart.');
+        logger.warn('Logged out — clearing session. Waiting 90s for QR.');
         await clearAuth();
-        if (restartTimer) clearTimeout(restartTimer);
-        restartTimer = setTimeout(() => {
-          if (awaitingPairing) startWhatsApp({ telegram });
-        }, 90_000);
+        reconnectTimer = setTimeout(() => startWhatsApp({ telegram }), 90_000);
         return;
       }
 
-      setTimeout(() => startWhatsApp({ telegram }), 3000);
+      // --- generic close
+      reconnectTimer = setTimeout(() => startWhatsApp({ telegram }), 5_000);
     }
   });
 
-  // messages.upsert — اربطه لسوكت واحد فقط
-  try { sock.ev.removeAllListeners('messages.upsert'); } catch {}
+  // ensure one handler only
+  sock.ev.removeAllListeners('messages.upsert');
   sock.ev.on('messages.upsert', onMessageUpsert(sock));
 
   return sock;
 }
 
+// ---------------- STARTUP LOGIC ----------------
 async function startWhatsApp({ telegram } = {}) {
   if (_starting) return _sock;
   _starting = true;
   try {
     await acquireLockOrExit();
     if (_sock) return _sock;
+
     _sock = await createSocket({ telegram });
-    const shutdown = () => {
-      logger.warn('SIGTERM/SIGINT: closing WA socket');
+
+    const shutdown = async () => {
+      logger.warn('Graceful shutdown: closing WA socket.');
       safeCloseSock(_sock);
       _sock = null;
-      releaseLock();
+      await releaseLock();
+      process.exit(0);
     };
+
     process.once('SIGINT', shutdown);
     process.once('SIGTERM', shutdown);
     return _sock;
+  } catch (e) {
+    logger.error({ e, stack: e?.stack }, 'startWhatsApp failed.');
+    process.exit(1);
   } finally {
     _starting = false;
   }
