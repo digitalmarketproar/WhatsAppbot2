@@ -1,29 +1,24 @@
 'use strict';
 
-/**
- * نقطة تشغيل الخدمة:
- * - تشغيل Express (سيرفر واحد)
- * - تشغيل بوت تيليجرام بالـ Webhook على نفس السيرفر
- * - تشغيل واتساب وتمرير واجهة تيليجرام (لإرسال QR للأدمن)
- */
-
+const { startExpress } = require('./src/app/express');
+const { startTelegramBot } = require('./src/app/telegram');
+const { startWhatsApp } = require('./src/app/whatsapp');
 const logger = require('./src/lib/logger');
-const { startExpress } = require('./src/app/express');            // ✅ استخدم Express الموحد
-const { startTelegramBot } = require('./src/app/telegram');        // ✅ الاسم الصحيح
-const { startWhatsApp } = require('./src/app/whatsapp');           // ✅ كما هو
 
 (async () => {
   try {
-    // 1) سيرفر واحد
-    const app = startExpress(); // يستمع على process.env.PORT و 0.0.0.0
+    // إنشاء السيرفر Express (صحي + Webhook لتليجرام)
+    const app = startExpress();
 
-    // 2) تيليجرام ويبهوك على نفس السيرفر
-    const telegram = await startTelegramBot({ app }); // يرجّع كائن فيه sendPhoto/sendQR
+    // بدء بوت التليجرام باستخدام Webhook على نفس السيرفر
+    const telegram = await startTelegramBot({ app });
 
-    // 3) واتساب بواجهة تيليجرام لارسال QR
+    // بدء بوت واتساب وتمرير تليجرام له (ليرسل QR مثلًا)
     await startWhatsApp({ telegram });
+
+    logger.info('🚀 Both Telegram and WhatsApp bots are running successfully!');
   } catch (e) {
-    logger.error({ err: e, stack: e?.stack }, 'Fatal error in bootstrap');
+    logger.error({ err: e, stack: e?.stack }, '❌ Fatal bootstrap error');
     process.exit(1);
   }
 })();
