@@ -1,105 +1,63 @@
 'use strict';
 
 /**
- * WA socket with Mongo session + singleton lock + safe reconnects
- * - Prevent multiple sockets
- * - Delay on 440 conflict
- * - One messages.upsert handler bound per socket
+ * WhatsApp (Baileys) + Mongo Session + Singleton Lock
+ * ---------------------------------------------------
+ * - اتصال واحد فقط عبر قفل في Mongo (locks)
+ * - إعادة اتصال آمنة، وتأخير في حالة 440 (conflict)
+ * - مستمع messages.upsert مربوط مرة واحدة لكل سوكِت
+ * - إرسال QR إلى تيليجرام إذا توفر كائن telegram أو متغيرات البيئة
  */
 
 const {
   default: makeWASocket,
   fetchLatestBaileysVersion,
-  DisconnectReason
+  DisconnectReason,
 } = require('@whiskeysockets/baileys');
 
-const { MongoClient }  = require('mongodb');
-const QRCode           = require('qrcode');
+const { MongoClient } = require('mongodb');
+const QRCode = require('qrcode');
 
-const logger               = require('../lib/logger');
-const { mongoAuthState }   = require('../lib/wa-mongo-auth');
-const { registerSelfHeal } = require('../lib/selfheal');
-const { onMessageUpsert }  = require('../handlers/messages');
+const logger                 = require('../lib/logger');
+const { mongoAuthState }     = require('../lib/wa-mongo-auth');
+const { registerSelfHeal }   = require('../lib/selfheal');
+const { onMessageUpsert }    = require('../handlers/messages');
 
 const MONGO_URI   = process.env.MONGODB_URI || process.env.MONGODB_URL;
-const WA_LOCK_KEY =
-  process.env.WA_LOCK_KEY ||
-  `wa_lock_${process.env.RENDER_SERVICE_ID || process.env.PHONE_NUMBER || 'singleton'}`;
+const WA_LOCK_KEY = process.env.WA_LOCK_KEY || 'wa_lock_singleton';
+
+// اختياري: لو أردت إرسال الـ QR عبر Telegram بدون تمرير كائن telegram من الخارج
+const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+const TG_ADMIN = process.env.TELEGRAM_ADMIN_ID || '';
 
 let _lockMongoClient = null;
 let _lockHeld = false;
-let _lockHeartbeat = null;
+let _lockTicker = null;
 let _sock = null;
 let _starting = false;
 
-async function acquireLockOrExit() {
-  if (!MONGO_URI) throw new Error('MONGODB_URI required');
+// ------- أدوات مساعدة -------
 
-  const holderId = process.env.RENDER_INSTANCE_ID || process.env.HOSTNAME || String(process.pid);
-  _lockMongoClient = new MongoClient(MONGO_URI, { serverSelectionTimeoutMS: 8000 });
-  await _lockMongoClient.connect();
-  const col = _lockMongoClient.db().collection('locks');
-
-  const STALE_MS = 90_000; // صلاحية القفل 90 ثانية
-  const start = Date.now();
-
-  while (true) {
-    const now = Date.now();
-    const filter = {
-      _id: WA_LOCK_KEY,
-      $or: [
-        { holderId },                       // أنا المالك الحالي
-        { ts: { $lt: now - STALE_MS } },    // قفل منتهي الصلاحية
-        { holderId: { $exists: false } }    // لا يوجد مالك
-      ]
-    };
-    const update = { $set: { holderId, ts: now } };
-    const opts   = { upsert: true, returnDocument: 'after' };
-
-    try {
-      const out = await col.findOneAndUpdate(filter, update, opts);
-      if (out && out.value && out.value.holderId === holderId) {
-        _lockHeld = true;
-        logger.info({ holderId, key: WA_LOCK_KEY }, '✅ Acquired / refreshed WA singleton lock.');
-        // نبضة تحديث القفل كل 30 ثانية
-        if (_lockHeartbeat) clearInterval(_lockHeartbeat);
-        _lockHeartbeat = setInterval(async () => {
-          try { await col.updateOne({ _id: WA_LOCK_KEY }, { $set: { ts: Date.now() } }); } catch {}
-        }, 30_000);
-        return;
-      }
-
-      // لم نحصل على القفل — انتظر وحاول مجددًا
-      logger.warn(
-        { currentHolder: out?.value?.holderId },
-        'Another instance holds the WA lock. Will retry in 20s.'
-      );
-      await new Promise(r => setTimeout(r, 20_000));
-    } catch (e) {
-      // يحل E11000 الناجم عن سباق upsert
-      if (e?.code === 11000) {
-        await new Promise(r => setTimeout(r, 2_000));
-        continue;
-      }
-      throw e;
-    }
-
-    // حماية: لو طال الانتظار كثيرًا
-    if (Date.now() - start > 5 * 60_000) {
-      logger.error('Could not obtain WA lock after 5 minutes, exiting.');
-      process.exit(1);
-    }
+async function getMongoClient() {
+  if (!_lockMongoClient || !_lockMongoClient.topology?.isConnected?.()) {
+    _lockMongoClient = new MongoClient(MONGO_URI, {
+      maxPoolSize: Number(process.env.MAX_POOL_SIZE || 5),
+      serverSelectionTimeoutMS: 8000,
+    });
+    await _lockMongoClient.connect();
   }
+  return _lockMongoClient;
 }
 
-async function releaseLock() {
-  try {
-    if (_lockHeartbeat) { clearInterval(_lockHeartbeat); _lockHeartbeat = null; }
-    if (_lockHeld) {
-      await _lockMongoClient?.db()?.collection('locks')?.deleteOne?.({ _id: WA_LOCK_KEY });
-      _lockHeld = false;
-    }
-  } catch {}
+function scheduleProcessCleanup() {
+  if (scheduleProcessCleanup._wired) return;
+  scheduleProcessCleanup._wired = true;
+  const close = async () => {
+    try { await _lockMongoClient?.close?.(); } catch {}
+    process.exit(0);
+  };
+  process.once('SIGINT', close);
+  process.once('SIGTERM', close);
 }
 
 function safeCloseSock(s) {
@@ -107,14 +65,109 @@ function safeCloseSock(s) {
   try { s?.ws?.close?.(); } catch {}
 }
 
+async function sendQRToTelegram({ pngBuffer, rawQR, telegram }) {
+  try {
+    if (telegram?.sendPhoto) {
+      await telegram.sendPhoto(pngBuffer, { caption: 'Scan this WhatsApp QR within 1 minute' });
+      return;
+    }
+  } catch (e) {
+    logger.warn({ e: e?.message }, 'sendPhoto via passed telegram object failed');
+  }
+
+  // خطة احتياط: استخدام Telegram API مباشرة إن وُجِد TOKEN و ADMIN
+  try {
+    if (TG_TOKEN && TG_ADMIN && typeof fetch === 'function') {
+      const form = new FormData();
+      form.append('chat_id', TG_ADMIN);
+      form.append('caption', 'Scan this WhatsApp QR within 1 minute');
+      // سنرسل الـ QR كنص إذا تعذّر رفع الصورة (لتفادي مشاكل multipart في بعض البيئات)
+      // الحل الأبسط والموثوق هنا: إرسال نص فقط
+      await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ chat_id: TG_ADMIN, text: `QR:\n\`${rawQR}\``, parse_mode: 'Markdown' }),
+      });
+      return;
+    }
+  } catch (e) {
+    logger.warn({ e: e?.message }, 'sending QR via Telegram HTTP failed');
+  }
+
+  logger.warn('No Telegram integration available to deliver QR.');
+}
+
+// ------- قفل الـ Singleton في Mongo -------
+
+async function acquireLockOrExit() {
+  if (!MONGO_URI) throw new Error('MONGODB_URI required');
+  scheduleProcessCleanup();
+
+  const client = await getMongoClient();
+  const col = client.db().collection('locks');
+
+  const now = Date.now();
+  const holderId = process.env.RENDER_INSTANCE_ID || process.env.HOSTNAME || String(process.pid);
+  const STALE_MS = 3 * 60 * 1000;
+
+  try {
+    const res = await col.findOneAndUpdate(
+      {
+        _id: WA_LOCK_KEY,
+        $or: [
+          { holderId },
+          { ts: { $lt: now - STALE_MS } },
+          { holderId: { $exists: false } },
+        ],
+      },
+      { $set: { holderId, ts: now } },
+      { upsert: true, returnDocument: 'after' }
+    );
+
+    if (!res.value || (res.value.holderId && res.value.holderId !== holderId)) {
+      logger.warn({ currentHolder: res.value?.holderId }, 'Another instance holds the WA lock. Exiting.');
+      process.exit(0);
+    }
+
+    _lockHeld = true;
+    logger.info({ holderId, key: WA_LOCK_KEY }, '✅ Acquired / refreshed WA singleton lock.');
+
+    // نبقي الطابع الزمني حديثًا
+    if (_lockTicker) clearInterval(_lockTicker);
+    _lockTicker = setInterval(async () => {
+      try {
+        await col.updateOne({ _id: WA_LOCK_KEY }, { $set: { ts: Date.now() } });
+      } catch (e) {
+        logger.warn({ e: e?.message }, 'lock heartbeat failed');
+      }
+    }, 30_000);
+  } catch (e) {
+    // في حال حدث E11000 أو أي خطأ سباق — اخرج بهدوء
+    logger.error({ e, stack: e?.stack }, 'acquireLockOrExit error');
+    process.exit(0);
+  }
+}
+
+async function releaseLock() {
+  try {
+    if (_lockTicker) { clearInterval(_lockTicker); _lockTicker = null; }
+    if (_lockHeld) {
+      await _lockMongoClient?.db()?.collection('locks')?.deleteOne?.({ _id: WA_LOCK_KEY });
+      _lockHeld = false;
+    }
+  } catch {}
+}
+
+// ------- إنشاء وربط سوكِت Baileys -------
+
 async function createSocket({ telegram }) {
   const { version } = await fetchLatestBaileysVersion();
   const { state, saveCreds, clearAuth } = await mongoAuthState(logger);
 
   const sock = makeWASocket({
     version,
-    printQRInTerminal: false,
     auth: state,
+    printQRInTerminal: false,
     logger,
     syncFullHistory: false,
     markOnlineOnConnect: false,
@@ -126,26 +179,22 @@ async function createSocket({ telegram }) {
   registerSelfHeal(sock, logger);
 
   let awaitingPairing = false;
-  let restartTimer = null;
   let qrRotateTimer = null;
 
   sock.ev.on('connection.update', async (u) => {
     const { connection, lastDisconnect, qr } = u;
 
+    // إرسال QR
     if (qr) {
       try {
         const png = await QRCode.toBuffer(qr, { width: 360, margin: 1 });
-        if (telegram?.sendPhoto) {
-          await telegram.sendPhoto(png, { caption: 'Scan this WhatsApp QR within 1 minute' });
-        } else if (telegram?.sendQR) {
-          await telegram.sendQR(qr);
-        }
+        await sendQRToTelegram({ pngBuffer: png, rawQR: qr, telegram });
         awaitingPairing = true;
 
         if (qrRotateTimer) clearTimeout(qrRotateTimer);
         qrRotateTimer = setTimeout(async () => {
           if (awaitingPairing) {
-            logger.warn('QR expired — rotating for a fresh one.');
+            logger.warn('QR expired — rotating.');
             try { await clearAuth(); } catch {}
             try { safeCloseSock(sock); } catch {}
             _sock = null;
@@ -153,35 +202,26 @@ async function createSocket({ telegram }) {
           }
         }, 60_000);
       } catch (e) {
-        logger.warn({ e: e.message }, 'Failed to render/send QR; sending raw text as fallback.');
-        try { await telegram?.sendQR?.(qr); } catch {}
+        logger.warn({ e: e?.message }, 'QR rendering/sending failed, sending raw text only.');
+        await sendQRToTelegram({ pngBuffer: null, rawQR: qr, telegram });
         awaitingPairing = true;
-
-        if (qrRotateTimer) clearTimeout(qrRotateTimer);
-        qrRotateTimer = setTimeout(async () => {
-          if (awaitingPairing) {
-            logger.warn('QR expired — rotating after fallback text.');
-            try { await clearAuth(); } catch {}
-            try { safeCloseSock(sock); } catch {}
-            _sock = null;
-            startWhatsApp({ telegram });
-          }
-        }, 60_000);
       }
     }
 
+    // فتح اتصال
     if (connection === 'open') {
       logger.info('✅ WhatsApp connected.');
       awaitingPairing = false;
-      if (restartTimer) { clearTimeout(restartTimer); restartTimer = null; }
       if (qrRotateTimer) { clearTimeout(qrRotateTimer); qrRotateTimer = null; }
     }
 
+    // إغلاق اتصال
     if (connection === 'close') {
       const code =
         (lastDisconnect?.error && (lastDisconnect.error.output?.statusCode || lastDisconnect.error?.status)) || 0;
 
-      if (code === 440) {
+      if (code === 440) { // conflict (replaced)
+        logger.warn({ code }, '⚠️ WA connection closed.');
         logger.warn('Stream conflict detected — delaying reconnect 20s.');
         try { safeCloseSock(sock); } catch {}
         _sock = null;
@@ -189,36 +229,41 @@ async function createSocket({ telegram }) {
         return;
       }
 
-      logger.warn({ code }, '⚠️ WA connection closed.');
-      try { safeCloseSock(sock); } catch {}
-      _sock = null;
-
-      if (code === 515) {
+      if (code === 515) { // إعادة التيار
         logger.warn('Stream 515 — restarting socket without clearing auth.');
+        try { safeCloseSock(sock); } catch {}
+        _sock = null;
         setTimeout(() => startWhatsApp({ telegram }), 3_000);
         return;
       }
 
       if (code === DisconnectReason.loggedOut || code === 401) {
-        logger.warn('WA logged out — wiping. Waiting 90s to allow QR scan before restart.');
+        // تسجيل خروج حقيقي
+        logger.warn('WA logged out — wiping creds & keys, waiting 90s for rescanning QR.');
         await clearAuth();
-        if (restartTimer) clearTimeout(restartTimer);
-        restartTimer = setTimeout(() => {
-          if (awaitingPairing) startWhatsApp({ telegram });
-        }, 90_000);
+        try { safeCloseSock(sock); } catch {}
+        _sock = null;
+
+        setTimeout(() => startWhatsApp({ telegram }), 90_000);
         return;
       }
 
+      // غير ذلك: أعد المحاولة سريعًا
+      logger.warn({ code }, 'WA connection closed — retrying in 3s.');
+      try { safeCloseSock(sock); } catch {}
+      _sock = null;
       setTimeout(() => startWhatsApp({ telegram }), 3_000);
     }
   });
 
-  // messages.upsert — اربطه لسوكت واحد فقط
+  // اربط مستمع الرسائل مرة واحدة لهذا السوكِت
   try { sock.ev.removeAllListeners('messages.upsert'); } catch {}
   sock.ev.on('messages.upsert', onMessageUpsert(sock));
 
   return sock;
 }
+
+// ------- API عام للتشغيل -------
 
 async function startWhatsApp({ telegram } = {}) {
   if (_starting) return _sock;
@@ -229,9 +274,10 @@ async function startWhatsApp({ telegram } = {}) {
 
     _sock = await createSocket({ telegram });
 
+    // إغلاق نظيف
     const shutdown = () => {
       logger.warn('SIGTERM/SIGINT: closing WA socket');
-      safeCloseSock(_sock);
+      try { safeCloseSock(_sock); } catch {}
       _sock = null;
       releaseLock();
     };
