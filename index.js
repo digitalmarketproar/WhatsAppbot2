@@ -1,24 +1,36 @@
 'use strict';
 
-const { startExpress } = require('./src/app/express');
-const { startTelegramBot } = require('./src/app/telegram');
-const { startWhatsApp } = require('./src/app/whatsapp');
+/**
+ * نقطة تشغيل الخدمة:
+ * - يشغّل خادم HTTP الصحي (Express)
+ * - يشغّل بوت تيليجرام (Webhook) إن وُجد التوكن
+ * - يشغّل واتساب ويمرّر له كائن telegram لإرسال QR
+ */
+
 const logger = require('./src/lib/logger');
+const { startExpress } = require('./src/app/express');
+const { startTelegram } = require('./src/app/telegram');
+const { startWhatsApp } = require('./src/app/whatsapp');
 
 (async () => {
   try {
-    // إنشاء السيرفر Express (صحي + Webhook لتليجرام)
+    // 1) شغّل إكسبرس على PORT الخاص بـ Render
     const app = startExpress();
 
-    // بدء بوت التليجرام باستخدام Webhook على نفس السيرفر
-    const telegram = await startTelegramBot({ app });
+    // 2) شغّل تيليجرام (ويبهوك) - قد يرجع null لو مافي توكن
+    const telegram = await startTelegram({ app });
+    if (!telegram) {
+      logger.warn('Telegram bot did NOT start (no TELEGRAM_BOT_TOKEN or PUBLIC_URL).');
+    } else {
+      logger.info('🤖 Telegram bot is up (webhook attached).');
+    }
 
-    // بدء بوت واتساب وتمرير تليجرام له (ليرسل QR مثلًا)
+    // 3) شغّل واتساب ومرر له كائن تيليجرام (قد يكون null)
     await startWhatsApp({ telegram });
 
-    logger.info('🚀 Both Telegram and WhatsApp bots are running successfully!');
+    logger.info('🚀 Service bootstrapped: WhatsApp started; Telegram ' + (telegram ? 'up' : 'not running'));
   } catch (e) {
-    logger.error({ err: e, stack: e?.stack }, '❌ Fatal bootstrap error');
+    logger.error({ err: e, stack: e?.stack }, 'Fatal error in bootstrap');
     process.exit(1);
   }
 })();
