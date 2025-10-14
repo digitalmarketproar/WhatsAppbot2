@@ -1,43 +1,68 @@
 'use strict';
 
 /**
- * Mongo-backed Baileys auth state
- * - لا يحفظ initAuthCreds في Mongo إلا بعد أول creds.update (أو لاحقًا)
- * - يصلح مشكلة BSON Binary بتحويله إلى Buffer
- * - clearAuth يمسح الوثائق، ولا يعيد الكتابة مباشرة (ينتظر أول saveCreds)
+ * Mongo-backed Baileys auth state (strict Buffer sanitization)
+ * - يحوّل أي Binary/BSON أو كائنات مشابهة لـ Buffer إلى Buffers حقيقية
+ * - يصلّح كل الحقول الحساسة (noiseKey, signedIdentityKey, signedPreKey, advSecretKey,
+ *   pairingEphemeralKeyPair, account, me, processingPending, platform, preKeys, sessions...)
+ * - clearAuth يمسح ثم يُعيد تهيئة قالب نظيف
  */
 
 const { MongoClient } = require('mongodb');
 const { initAuthCreds, BufferJSON } = require('@whiskeysockets/baileys');
 
-const MONGO_URI     = process.env.MONGODB_URI || process.env.MONGODB_URL;
-const DB_NAME       = process.env.MONGODB_DB  || undefined; // اختياري
-const CREDS_COL     = process.env.WA_CREDS_COL || 'BaileysCreds';
-const KEYS_COL      = process.env.WA_KEYS_COL  || 'BaileysKey';
+const MONGO_URI = process.env.MONGODB_URI || process.env.MONGODB_URL;
+const DB_NAME   = process.env.MONGODB_DB  || undefined;
+const CREDS_COL = process.env.WA_CREDS_COL || 'BaileysCreds';
+const KEYS_COL  = process.env.WA_KEYS_COL  || 'BaileysKey';
 
-/** يحوّل أي قيمة BSON Binary إلى Buffer عادي */
-function toBuf(val) {
-  if (!val) return val;
-  if (Buffer.isBuffer(val)) return val;
-  if (val?.buffer instanceof Uint8Array) return Buffer.from(val.buffer);
-  if (val?._bsontype === 'Binary' && val?.buffer) return Buffer.from(val.buffer);
-  return val;
+/* ------------------------ Helpers: Buffer coercion ------------------------ */
+
+function isLikeBuffer(v) {
+  // أشكال قد ترجع من Mongo/JSON
+  if (!v) return false;
+  if (Buffer.isBuffer(v)) return true;
+  if (v instanceof Uint8Array) return true;
+  if (v?.type === 'Buffer' && Array.isArray(v?.data)) return true; // JSON.stringify(Buffer)
+  if (v?._bsontype === 'Binary' && v?.buffer) return true;         // BSON Binary
+  if (v?.buffer instanceof Uint8Array) return true;
+  return false;
 }
 
-/** تحويل شجري: أي حقول مفاتيح بداخل object */
-function deepFixBinary(obj) {
-  if (!obj || typeof obj !== 'object') return obj;
-  if (Buffer.isBuffer(obj)) return obj;
-  if (Array.isArray(obj)) return obj.map(deepFixBinary);
+function toBuf(v) {
+  if (!v) return v;
+  if (Buffer.isBuffer(v)) return v;
+  if (v instanceof Uint8Array) return Buffer.from(v);
+  if (v?.type === 'Buffer' && Array.isArray(v?.data)) return Buffer.from(v.data);
+  if (v?._bsontype === 'Binary' && v?.buffer) return Buffer.from(v.buffer);
+  if (v?.buffer instanceof Uint8Array) return Buffer.from(v.buffer);
+  return v;
+}
 
-  const out = {};
-  for (const [k, v] of Object.entries(obj)) {
+// تُصلح كل الحقول الثنائية داخل شجرة الاعتماد/المفاتيح
+function deepFixBinary(x) {
+  if (x == null) return x;
+  if (isLikeBuffer(x)) return toBuf(x);
+  if (Array.isArray(x)) return x.map(deepFixBinary);
+  if (typeof x !== 'object') return x;
+
+  const out = Array.isArray(x) ? [] : {};
+  for (const [k, v] of Object.entries(x)) {
+    // أسماء شائعة لحقول ثنائية في Baileys/Signal
     if (
-      k === 'private' || k === 'public' || k === 'keyData' ||
-      k === 'pubKey'  || k === 'prvKey'  || k === 'signature' ||
-      k === 'key'     || k === 'value'
+      k === 'private' || k === 'public' || k === 'privKey' || k === 'pubKey' ||
+      k === 'prvKey'  || k === 'signature' || k === 'keyData' || k === 'value' ||
+      k === 'noiseKey' || k === 'advSecretKey' || k === 'identityKey' ||
+      k === 'signedIdentityKey' || k === 'signedPreKey' ||
+      k === 'pairingEphemeralKeyPair' || k === 'account' ||
+      k === 'hash' || k === 'salt' || k === 'ciphertext'
     ) {
-      out[k] = toBuf(v);
+      // قد يكون الكائن داخله مفاتيح/خصائص أخرى — طبّق deep
+      if (v && typeof v === 'object' && !isLikeBuffer(v)) {
+        out[k] = deepFixBinary(v);
+      } else {
+        out[k] = toBuf(v);
+      }
     } else if (v && typeof v === 'object') {
       out[k] = deepFixBinary(v);
     } else {
@@ -46,6 +71,8 @@ function deepFixBinary(obj) {
   }
   return out;
 }
+
+/* ------------------------------ Main logic ------------------------------ */
 
 async function mongoAuthState(logger) {
   if (!MONGO_URI) throw new Error('MONGODB_URI required for mongoAuthState');
@@ -60,15 +87,27 @@ async function mongoAuthState(logger) {
   let credsDoc = await cCol.findOne({ _id: 'creds' });
   let creds = credsDoc?.data ? BufferJSON.reviver('', credsDoc.data) : null;
 
-  // لا تحفظ initAuthCreds في الداتابيس الآن — انتظر أول saveCreds
   if (!creds) {
     creds = initAuthCreds();
-    logger?.info?.('Initialized fresh Baileys creds in memory (not persisted yet).');
+    // خزّن كـ BufferJSON (سيحفظ Buffers بشكل صحيح)
+    await cCol.updateOne(
+      { _id: 'creds' },
+      { $set: { data: BufferJSON.replacer('', creds), createdAt: Date.now() } },
+      { upsert: true }
+    );
+    logger?.info?.('Initialized fresh Baileys creds in MongoDB.');
   } else {
+    // أصلح كل القيم الثنائية
     creds = deepFixBinary(creds);
+    // أعد حفظها بشكل مصحّح حتى لا تعود تالفة لاحقًا
+    await cCol.updateOne(
+      { _id: 'creds' },
+      { $set: { data: BufferJSON.replacer('', creds), repairedAt: Date.now() } },
+      { upsert: true }
+    );
   }
 
-  // ---- key store (Signal keys) ----
+  // ---- key store ----
   const keyStore = {
     async get(type, ids) {
       const data = {};
@@ -85,7 +124,7 @@ async function mongoAuthState(logger) {
       const ops = [];
       for (const category in data) {
         for (const id in data[category]) {
-          const value = BufferJSON.replacer('', data[category][id]);
+          const value = BufferJSON.replacer('', deepFixBinary(data[category][id]));
           ops.push({
             updateOne: {
               filter: { _id: `${category}-${id}` },
@@ -103,11 +142,12 @@ async function mongoAuthState(logger) {
     }
   };
 
-  // تُستدعى عند كل creds.update — هنا فقط نُثبّت للـ DB
   async function saveCreds() {
+    // Baileys يمرر كائن نفس المرجع — عالج قبل الحفظ
+    const fixed = deepFixBinary(creds);
     await cCol.updateOne(
       { _id: 'creds' },
-      { $set: { data: BufferJSON.replacer('', creds), updatedAt: Date.now() }, $setOnInsert: { createdAt: Date.now() } },
+      { $set: { data: BufferJSON.replacer('', fixed), updatedAt: Date.now() } },
       { upsert: true }
     );
   }
@@ -115,9 +155,12 @@ async function mongoAuthState(logger) {
   async function clearAuth() {
     await cCol.deleteMany({});
     await kCol.deleteMany({});
-    // لا نعيد حفظ initAuthCreds الآن؛ نكتفي بإبقائها في الذاكرة حتى أول creds.update
     creds = initAuthCreds();
-    logger?.warn?.('Auth cleared from Mongo; fresh creds in memory (will persist on first saveCreds).');
+    await cCol.updateOne(
+      { _id: 'creds' },
+      { $set: { data: BufferJSON.replacer('', creds), createdAt: Date.now() } },
+      { upsert: true }
+    );
   }
 
   return {
