@@ -5,7 +5,8 @@
  * - يمنع تعدد المثيلات عبر Lock في Mongo
  * - يتعامل مع 440 (conflict) بتأخير محاولة الاتصال
  * - يربط messages.upsert على سوكت واحد
- * - يدعم WA_FORCE_FRESH=1 لمسح الجلسة عند الإقلاع لإجبار QR
+ * - يدعم WA_FORCE_FRESH=1 لمسح الجلسة عند الإقلاع لإجبار QR (مرة واحدة فقط)
+ * - إرسال الـQR إلى تيليجرام بطرق متعددة + طباعة احتياطية في اللوج
  */
 
 const {
@@ -25,12 +26,16 @@ const { onMessageUpsert }  = require('../handlers/messages');
 const MONGO_URI     = process.env.MONGODB_URI || process.env.MONGODB_URL;
 const WA_LOCK_KEY   = process.env.WA_LOCK_KEY || 'wa_lock_singleton';
 const FORCE_FRESH   = String(process.env.WA_FORCE_FRESH || '0') === '1';
+const QR_TO_CONSOLE = String(process.env.WA_QR_TO_CONSOLE || '0') === '1';
 
 let _lockMongoClient = null;
 let _lockHeld = false;
 let _lockHeartbeat = null;
 let _sock = null;
 let _starting = false;
+let _freshClearedThisBoot = false;
+
+/* ------------------------------ Lock helpers ------------------------------ */
 
 async function acquireLockOrExit() {
   if (!MONGO_URI) throw new Error('MONGODB_URI required');
@@ -43,13 +48,11 @@ async function acquireLockOrExit() {
   const now = Date.now();
   const STALE_MS = 3 * 60 * 1000;
 
-  // حاول امتلاك القفل إن كان قديمًا/لنا/غير موجود
   const res = await col.updateOne(
     { _id: WA_LOCK_KEY, $or: [{ holderId }, { ts: { $lt: now - STALE_MS } }, { holderId: { $exists: false } }] },
     { $set: { holderId, ts: now } },
     { upsert: true }
   ).catch(e => {
-    // في حالات نادرة dup key مع upsert — تجاهل واعتمد على holderId
     logger.warn({ e }, 'lock upsert race; continuing');
     return { matchedCount: 1 };
   });
@@ -80,24 +83,70 @@ async function releaseLock() {
   } catch {}
 }
 
+/* ------------------------------ Utils ------------------------------ */
+
 function safeCloseSock(s) {
   try { s?.end?.(); } catch {}
   try { s?.ws?.close?.(); } catch {}
 }
 
+async function sendQrToTelegram({ telegram, qr, png }) {
+  const caption = 'Scan this WhatsApp QR within 1 minute';
+
+  // 1) حاول صورة (لو عندك رابر يضيف chatId داخليًا)
+  if (telegram?.sendPhoto) {
+    try {
+      await telegram.sendPhoto(png, { caption });
+      return true;
+    } catch (e) {
+      logger.warn({ e: e?.message }, 'sendPhoto failed');
+    }
+  }
+
+  // 2) حاول واجهة خاصة لإرسال QR كنص
+  if (telegram?.sendQR) {
+    try {
+      await telegram.sendQR(qr);
+      return true;
+    } catch (e) {
+      logger.warn({ e: e?.message }, 'sendQR failed');
+    }
+  }
+
+  // 3) حاول sendText (لو متاحة)
+  if (telegram?.sendText) {
+    try {
+      await telegram.sendText(`*WhatsApp QR*\n\`\`\`\n${qr}\n\`\`\``);
+      return true;
+    } catch (e) {
+      logger.warn({ e: e?.message }, 'sendText failed');
+    }
+  }
+
+  // 4) اطبع في اللوج كحل أخير (وركّب WA_QR_TO_CONSOLE=1 لو تحب دائمًا)
+  if (QR_TO_CONSOLE || !telegram) {
+    logger.info({ qr }, 'QR (fallback)');
+  }
+
+  return false;
+}
+
+/* ------------------------------ Core ------------------------------ */
+
 async function createSocket({ telegram }) {
   const { version } = await fetchLatestBaileysVersion();
   const { state, saveCreds, clearAuth } = await mongoAuthState(logger);
 
-  // لو حاب تجبر QR جديد في كل إقلاع:
-  if (FORCE_FRESH) {
+  // FORCE_FRESH مرة واحدة فقط عند هذا البوت-أب
+  if (FORCE_FRESH && !_freshClearedThisBoot) {
     logger.warn('WA_FORCE_FRESH=1 — clearing auth on boot to force QR.');
     await clearAuth();
+    _freshClearedThisBoot = true;
   }
 
   const sock = makeWASocket({
     version,
-    printQRInTerminal: false, // سنرسل عبر تيليجرام
+    printQRInTerminal: QR_TO_CONSOLE, // ممكن تفعّله من env كنسخة احتياطية
     auth: state,
     logger,
     syncFullHistory: false,
@@ -117,11 +166,10 @@ async function createSocket({ telegram }) {
     const { connection, lastDisconnect, qr } = u;
 
     if (qr) {
-      // دائمًا أرسل الـQR بصرف النظر عن وجود وثائق في Mongo
       try {
         const png = await QRCode.toBuffer(qr, { width: 360, margin: 1 });
-        if (telegram?.sendPhoto)      await telegram.sendPhoto(png, { caption: 'Scan this WhatsApp QR within 1 minute' });
-        else if (telegram?.sendQR)    await telegram.sendQR(qr);
+        const ok = await sendQrToTelegram({ telegram, qr, png });
+        if (!ok) logger.warn('QR could not be delivered to Telegram; fallback(s) used.');
         awaitingPairing = true;
 
         if (qrRotateTimer) clearTimeout(qrRotateTimer);
@@ -135,8 +183,9 @@ async function createSocket({ telegram }) {
           }
         }, 60_000);
       } catch (e) {
-        logger.warn({ e: e.message }, 'Failed to render/send QR; sending raw as fallback.');
-        try { await telegram?.sendQR?.(qr); } catch {}
+        logger.warn({ e: e.message }, 'Failed to render QR buffer; sending raw as fallback.');
+        await sendQrToTelegram({ telegram, qr, png: null });
+        awaitingPairing = true;
       }
     }
 
