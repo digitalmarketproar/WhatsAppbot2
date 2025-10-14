@@ -144,12 +144,17 @@ async function createSocket({ telegram }) {
   });
 
   // عندما تتحدّث الاعتمادات وفيها me/registered نعتبره اقتران ناجح
-  sock.ev.on('creds.update', (creds) => {
-    try {
-      if (creds?.me || creds?.registered) {
-        _pairedOk = true;
-        logger.info({ me: creds?.me }, '🔐 creds updated — pairing considered complete');
-      }
+  sock.ev.on('creds.update', () => {
+  try {
+    const c = sock?.authState?.creds || state?.creds;
+    if (c?.me || c?.registered) {
+      _pairedOk = true;
+      logger.info({ me: c?.me }, '🔐 creds updated — pairing considered complete');
+    }
+  } catch {}
+  // احفظ الحالة الحالية (Baileys يعدّل نفس الكائن بالمرجع)
+  saveCreds();
+});
     } catch {}
     saveCreds(creds);
   });
