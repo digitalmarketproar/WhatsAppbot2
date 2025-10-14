@@ -6,14 +6,17 @@
  * - تهدئة + تدوير QR
  * - إلغاء أي مؤقّتات عند close لتفادي مسح الاعتماد بعد الاقتران
  * - تجاهل أي QR بعد أول اقتران ناجح
+ * - تفعيل msgRetryCounterCache + getMessage لحل مشاكل فك التشفير/الريترايز
  */
 
 const {
   default: makeWASocket,
   fetchLatestBaileysVersion,
-  DisconnectReason
+  DisconnectReason,
+  makeInMemoryStore
 } = require('@whiskeysockets/baileys');
 
+const NodeCache        = require('node-cache');
 const { MongoClient }  = require('mongodb');
 const QRCode           = require('qrcode');
 
@@ -132,11 +135,15 @@ async function createSocket({ telegram }) {
     _pairedOk = false;
   }
 
-  // 👇 مهم: لو الاعتماد موجود (me/registered)، اعتبره مقترن من البداية
+  // ✅ لو الاعتماد موجود (me/registered)، اعتبره مقترن من البداية
   if (state?.creds?.me || state?.creds?.registered) {
     _pairedOk = true;
     logger.info({ me: state?.creds?.me }, '🔐 existing creds detected — treating as already paired');
   }
+
+  // ⬇️ store للرسائل + كاش للريترايز (مهم جدًا لفك التشفير بعد PreKeyError)
+  const store = makeInMemoryStore({ logger });
+  const msgRetryCounterCache = new NodeCache();
 
   const sock = makeWASocket({
     version,
@@ -147,7 +154,21 @@ async function createSocket({ telegram }) {
     markOnlineOnConnect: false,
     keepAliveIntervalMs: 20_000,
     browser: ['Ubuntu', 'Chrome', '22.04.4'],
+
+    // هذان الخياران يعالجان مشاكل فك التشفير/إعادة المحاولة
+    msgRetryCounterCache,
+    getMessage: async (key) => {
+      try {
+        const msg = await store.loadMessage(key.remoteJid, key.id);
+        return msg?.message || null;
+      } catch {
+        return null;
+      }
+    }
   });
+
+  // اربط الستـور بالأحداث حتى يخزن الرسائل
+  store.bind(sock.ev);
 
   // عند تحديث الاعتماد: علّم مقترن (إن توفّر) واحفظ الحالة
   sock.ev.on('creds.update', () => {
@@ -249,6 +270,7 @@ async function createSocket({ telegram }) {
     }
   });
 
+  // ربط هاندلر الرسائل (بعد ما صار عندنا store)
   try { sock.ev.removeAllListeners('messages.upsert'); } catch {}
   sock.ev.on('messages.upsert', onMessageUpsert(sock));
 
