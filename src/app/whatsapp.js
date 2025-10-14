@@ -187,12 +187,11 @@ async function createSocket({ telegram }) {
         logger.info({ sinceMs: now - _lastQrSentAt }, 'QR throttled — duplicate ignored');
       }
 
-      // دوّر الـQR بعد المهلة، لكن **لا تمسح الاعتماد** إن حدث إغلاق/اقتران
+      // دوّر الـQR بعد المهلة، لكن **لا تمسح الاعتماد** إطلاقًا
       if (qrRotateTimer) clearTimeout(qrRotateTimer);
       qrRotateTimer = setTimeout(async () => {
         if (awaitingPairing && !_pairedOk) {
-          logger.warn('QR expired — rotating after timeout.');
-          try { await clearAuth(); } catch {}
+          logger.warn('QR expired — rotating after timeout (no clear).');
           try { safeCloseSock(sock); } catch {}
           _sock = null;
           startWhatsApp({ telegram });
