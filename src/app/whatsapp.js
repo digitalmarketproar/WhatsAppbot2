@@ -2,12 +2,10 @@
 
 /**
  * WA socket with Mongo session + singleton lock + safe reconnects
- * - يمنع تعدد المثيلات عبر Lock في Mongo
- * - يتعامل مع 440 (conflict) بتأخير محاولة الاتصال
- * - يربط messages.upsert على سوكت واحد
- * - يدعم WA_FORCE_FRESH=1 لمسح الجلسة عند الإقلاع لإجبار QR (مرة واحدة فقط)
- * - إرسال الـQR إلى تيليجرام بطرق متعددة + طباعة احتياطية في اللوج
- * - ✅ تهدئة إرسال QR + تدوير كل دقيقتين افتراضيًا
+ * - Lock لمنع تعدد المثيلات
+ * - تهدئة + تدوير QR
+ * - إلغاء أي مؤقّتات عند close لتفادي مسح الاعتماد بعد الاقتران
+ * - تجاهل أي QR بعد أول اقتران ناجح
  */
 
 const {
@@ -29,9 +27,8 @@ const WA_LOCK_KEY   = process.env.WA_LOCK_KEY || 'wa_lock_singleton';
 const FORCE_FRESH   = String(process.env.WA_FORCE_FRESH || '0') === '1';
 const QR_TO_CONSOLE = String(process.env.WA_QR_TO_CONSOLE || '0') === '1';
 
-// ⏱️ تحكم بزمن التدوير والتهدئة من ENV
-const QR_ROTATE_MS   = Number(process.env.WA_QR_ROTATE_MS   || 120_000); // 2 دقائق
-const QR_COOLDOWN_MS = Number(process.env.WA_QR_COOLDOWN_MS || 110_000); // لا نعيد الإرسال خلال ~دقيقتين
+const QR_ROTATE_MS   = Number(process.env.WA_QR_ROTATE_MS   || 120_000); // 2 min
+const QR_COOLDOWN_MS = Number(process.env.WA_QR_COOLDOWN_MS || 110_000); // ~2 min
 
 let _lockMongoClient = null;
 let _lockHeld = false;
@@ -40,8 +37,9 @@ let _sock = null;
 let _starting = false;
 let _freshClearedThisBoot = false;
 
-// آخر وقت أُرسل فيه QR لتجنب التكرار السريع
+// QR state
 let _lastQrSentAt = 0;
+let _pairedOk = false; // بعد أول اقتران ناجح نتجاهل أي QR لاحق
 
 /* ------------------------------ Lock helpers ------------------------------ */
 
@@ -101,44 +99,23 @@ function safeCloseSock(s) {
 async function sendQrToTelegram({ telegram, qr, png }) {
   const caption = 'Scan this WhatsApp QR within 2 minutes';
 
-  // 1) صورة عبر sendPhoto (يدعم Buffer)
   if (telegram?.sendPhoto) {
     try {
-      await telegram.sendPhoto(png, {
-        caption,
-        filename: 'qr.png'
-      });
+      await telegram.sendPhoto(png, { caption, filename: 'qr.png' });
       return true;
-    } catch (e) {
-      logger.warn({ e: e?.message }, 'sendPhoto failed');
-    }
+    } catch (e) { logger.warn({ e: e?.message }, 'sendPhoto failed'); }
   }
-
-  // 2) إن وُجدت API خاصة
   if (telegram?.sendQR) {
-    try {
-      await telegram.sendQR(qr);
-      return true;
-    } catch (e) {
-      logger.warn({ e: e?.message }, 'sendQR failed');
-    }
+    try { await telegram.sendQR(qr); return true; }
+    catch (e) { logger.warn({ e: e?.message }, 'sendQR failed'); }
   }
-
-  // 3) نص خام
   if (telegram?.sendText) {
     try {
       await telegram.sendText(`*WhatsApp QR*\n\`\`\`\n${qr}\n\`\`\`\n(Valid ~2 minutes)`);
       return true;
-    } catch (e) {
-      logger.warn({ e: e?.message }, 'sendText failed');
-    }
+    } catch (e) { logger.warn({ e: e?.message }, 'sendText failed'); }
   }
-
-  // 4) سجل (أو فعّل WA_QR_TO_CONSOLE=1 لطباعة دائمة)
-  if (QR_TO_CONSOLE || !telegram) {
-    logger.info({ qr }, 'QR (fallback)');
-  }
-
+  if (QR_TO_CONSOLE || !telegram) logger.info({ qr }, 'QR (fallback)');
   return false;
 }
 
@@ -148,16 +125,16 @@ async function createSocket({ telegram }) {
   const { version } = await fetchLatestBaileysVersion();
   const { state, saveCreds, clearAuth } = await mongoAuthState(logger);
 
-  // FORCE_FRESH مرة واحدة فقط عند هذا الإقلاع
   if (FORCE_FRESH && !_freshClearedThisBoot) {
     logger.warn('WA_FORCE_FRESH=1 — clearing auth on boot to force QR.');
     await clearAuth();
     _freshClearedThisBoot = true;
+    _pairedOk = false;
   }
 
   const sock = makeWASocket({
     version,
-    printQRInTerminal: QR_TO_CONSOLE, // كخيار احتياطي
+    printQRInTerminal: QR_TO_CONSOLE,
     auth: state,
     logger,
     syncFullHistory: false,
@@ -166,40 +143,54 @@ async function createSocket({ telegram }) {
     browser: ['Ubuntu', 'Chrome', '22.04.4'],
   });
 
-  sock.ev.on('creds.update', saveCreds);
+  // عندما تتحدّث الاعتمادات وفيها me/registered نعتبره اقتران ناجح
+  sock.ev.on('creds.update', (creds) => {
+    try {
+      if (creds?.me || creds?.registered) {
+        _pairedOk = true;
+        logger.info({ me: creds?.me }, '🔐 creds updated — pairing considered complete');
+      }
+    } catch {}
+    saveCreds(creds);
+  });
+
   registerSelfHeal(sock, logger);
 
   let awaitingPairing = false;
   let restartTimer = null;
   let qrRotateTimer = null;
 
+  const clearTimers = () => {
+    if (restartTimer) { clearTimeout(restartTimer); restartTimer = null; }
+    if (qrRotateTimer) { clearTimeout(qrRotateTimer); qrRotateTimer = null; }
+  };
+
   sock.ev.on('connection.update', async (u) => {
     const { connection, lastDisconnect, qr } = u;
 
-    // 🎯 تهدئة إرسال الـQR + تدوير كل QR_ROTATE_MS
-    if (qr) {
+    // لا ترسل QR إن كنا مقترنين بالفعل
+    if (qr && !_pairedOk) {
       const now = Date.now();
-      if (now - _lastQrSentAt < QR_COOLDOWN_MS) {
-        logger.info({ sinceMs: now - _lastQrSentAt }, 'QR throttled — ignoring duplicate QR emission');
-      } else {
+      if (now - _lastQrSentAt >= QR_COOLDOWN_MS) {
         try {
           const png = await QRCode.toBuffer(qr, { width: 360, margin: 1 });
-          const ok = await sendQrToTelegram({ telegram, qr, png });
-          if (!ok) logger.warn('QR could not be delivered to Telegram; fallback(s) used.');
+          await sendQrToTelegram({ telegram, qr, png });
           awaitingPairing = true;
           _lastQrSentAt = now;
         } catch (e) {
-          logger.warn({ e: e.message }, 'Failed to render QR buffer; sending raw as fallback.');
+          logger.warn({ e: e.message }, 'Failed to render QR; sending raw fallback.');
           await sendQrToTelegram({ telegram, qr, png: null });
           awaitingPairing = true;
           _lastQrSentAt = now;
         }
+      } else {
+        logger.info({ sinceMs: now - _lastQrSentAt }, 'QR throttled — duplicate ignored');
       }
 
-      // دوِّر الـQR بعد QR_ROTATE_MS (ما لم يتم الاقتران)
+      // دوّر الـQR بعد المهلة، لكن **لا تمسح الاعتماد** إن حدث إغلاق/اقتران
       if (qrRotateTimer) clearTimeout(qrRotateTimer);
       qrRotateTimer = setTimeout(async () => {
-        if (awaitingPairing) {
+        if (awaitingPairing && !_pairedOk) {
           logger.warn('QR expired — rotating after timeout.');
           try { await clearAuth(); } catch {}
           try { safeCloseSock(sock); } catch {}
@@ -211,16 +202,20 @@ async function createSocket({ telegram }) {
 
     if (connection === 'open') {
       logger.info('✅ WhatsApp connected.');
+      _pairedOk = true;           // اعتبره تم
       awaitingPairing = false;
-      if (restartTimer) { clearTimeout(restartTimer); restartTimer = null; }
-      if (qrRotateTimer) { clearTimeout(qrRotateTimer); qrRotateTimer = null; }
+      clearTimers();
     }
 
     if (connection === 'close') {
       const code =
         (lastDisconnect?.error && (lastDisconnect.error.output?.statusCode || lastDisconnect.error?.status)) || 0;
-      logger.warn({ code }, '⚠️ WA connection closed.');
 
+      // مهم جدًا: أوقف مؤقّت تدوير QR وإلّا يمسح الاعتماد بعد الاقتران
+      clearTimers();
+      awaitingPairing = false;
+
+      logger.warn({ code }, '⚠️ WA connection closed.');
       try { safeCloseSock(sock); } catch {}
       _sock = null;
 
@@ -230,6 +225,7 @@ async function createSocket({ telegram }) {
         return;
       }
       if (code === 515) {
+        // إعادة تشغيل متوقعة بعد pairing — لا نمسح الاعتماد إطلاقًا
         logger.warn('Stream 515 — restarting socket (no clear).');
         setTimeout(() => startWhatsApp({ telegram }), 3_000);
         return;
@@ -237,17 +233,16 @@ async function createSocket({ telegram }) {
       if (code === DisconnectReason.loggedOut || code === 401) {
         logger.warn('Logged out — clearing auth & waiting 90s for QR pairing.');
         await clearAuth();
-        if (restartTimer) clearTimeout(restartTimer);
         restartTimer = setTimeout(() => {
-          if (awaitingPairing) startWhatsApp({ telegram });
+          if (!_pairedOk) startWhatsApp({ telegram });
         }, 90_000);
         return;
       }
+
       setTimeout(() => startWhatsApp({ telegram }), 3_000);
     }
   });
 
-  // messages.upsert — اربطه لسوكت واحد فقط
   try { sock.ev.removeAllListeners('messages.upsert'); } catch {}
   sock.ev.on('messages.upsert', onMessageUpsert(sock));
 
