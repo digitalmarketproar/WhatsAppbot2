@@ -6,14 +6,13 @@
  * - تهدئة + تدوير QR
  * - إلغاء أي مؤقّتات عند close لتفادي مسح الاعتماد بعد الاقتران
  * - تجاهل أي QR بعد أول اقتران ناجح
- * - تفعيل msgRetryCounterCache + getMessage لحل مشاكل فك التشفير/الريترايز
+ * - msgRetryCounterCache + getMessage مع مخزن بسيط داخل الذاكرة بدل makeInMemoryStore
  */
 
 const {
   default: makeWASocket,
   fetchLatestBaileysVersion,
   DisconnectReason,
-  makeInMemoryStore
 } = require('@whiskeysockets/baileys');
 
 const NodeCache        = require('node-cache');
@@ -135,14 +134,14 @@ async function createSocket({ telegram }) {
     _pairedOk = false;
   }
 
-  // ✅ لو الاعتماد موجود (me/registered)، اعتبره مقترن من البداية
+  // إن كان لدينا me/registered في الاعتماد، اعتبره مقترن مسبقًا
   if (state?.creds?.me || state?.creds?.registered) {
     _pairedOk = true;
     logger.info({ me: state?.creds?.me }, '🔐 existing creds detected — treating as already paired');
   }
 
-  // ⬇️ store للرسائل + كاش للريترايز (مهم جدًا لفك التشفير بعد PreKeyError)
-  const store = makeInMemoryStore({ logger });
+  // مخزن رسائل بسيط بالذاكرة + كاش لعداد الريترايز
+  const messageStore = new Map(); // key: `${jid}-${id}` -> full proto message
   const msgRetryCounterCache = new NodeCache();
 
   const sock = makeWASocket({
@@ -155,20 +154,32 @@ async function createSocket({ telegram }) {
     keepAliveIntervalMs: 20_000,
     browser: ['Ubuntu', 'Chrome', '22.04.4'],
 
-    // هذان الخياران يعالجان مشاكل فك التشفير/إعادة المحاولة
+    // يساعد في إعادة المحاولة وفك التشفير
     msgRetryCounterCache,
     getMessage: async (key) => {
       try {
-        const msg = await store.loadMessage(key.remoteJid, key.id);
-        return msg?.message || null;
+        const k = `${key.remoteJid}-${key.id}`;
+        const saved = messageStore.get(k);
+        return saved?.message || null;
       } catch {
         return null;
       }
     }
   });
 
-  // اربط الستـور بالأحداث حتى يخزن الرسائل
-  store.bind(sock.ev);
+  // نسجّل أي رسائل واردة في messageStore قبل تمريرها للهاندلر
+  const saveIncoming = (upsert) => {
+    try {
+      const msgs = upsert?.messages || [];
+      for (const m of msgs) {
+        const jid = m?.key?.remoteJid;
+        const id  = m?.key?.id;
+        if (jid && id) {
+          messageStore.set(`${jid}-${id}`, m);
+        }
+      }
+    } catch {}
+  };
 
   // عند تحديث الاعتماد: علّم مقترن (إن توفّر) واحفظ الحالة
   sock.ev.on('creds.update', () => {
@@ -238,7 +249,7 @@ async function createSocket({ telegram }) {
       const code =
         (lastDisconnect?.error && (lastDisconnect.error.output?.statusCode || lastDisconnect.error?.status)) || 0;
 
-      // مهم جدًا: أوقف مؤقّت تدوير QR وإلّا يمسح الاعتماد بعد الاقتران
+      // مهم: أوقف مؤقّتات QR وإلا قد نمسح اعتماد بعد اقتران
       clearTimers();
       awaitingPairing = false;
 
@@ -270,9 +281,12 @@ async function createSocket({ telegram }) {
     }
   });
 
-  // ربط هاندلر الرسائل (بعد ما صار عندنا store)
+  // اربط هاندلر الرسائل: أولًا نخزن الرسائل، ثم نمررها للهاندلر الحقيقي
   try { sock.ev.removeAllListeners('messages.upsert'); } catch {}
-  sock.ev.on('messages.upsert', onMessageUpsert(sock));
+  sock.ev.on('messages.upsert', (upsert) => {
+    saveIncoming(upsert);
+    try { onMessageUpsert(sock)(upsert); } catch (e) { logger.warn({ e: e?.message }, 'onMessageUpsert failed'); }
+  });
 
   return sock;
 }
