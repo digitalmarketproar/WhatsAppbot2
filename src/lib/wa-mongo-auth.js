@@ -2,9 +2,9 @@
 
 /**
  * Mongo-backed Baileys auth state
- * - يصلح مشكلة BSON Binary بتحويله إلى Buffer قبل تمريره للتشفير
- * - يعرض clearAuth لمسح الجلسة
- * - لا يعتبر وجود وثائق = Logged In؛ القرار يُترك لـ connection.update('open')
+ * - لا يحفظ initAuthCreds في Mongo إلا بعد أول creds.update (أو لاحقًا)
+ * - يصلح مشكلة BSON Binary بتحويله إلى Buffer
+ * - clearAuth يمسح الوثائق، ولا يعيد الكتابة مباشرة (ينتظر أول saveCreds)
  */
 
 const { MongoClient } = require('mongodb');
@@ -56,27 +56,20 @@ async function mongoAuthState(logger) {
   const cCol = db.collection(CREDS_COL);
   const kCol = db.collection(KEYS_COL);
 
-  // ---- load creds (أوراق الاعتماد) ----
+  // ---- load creds ----
   let credsDoc = await cCol.findOne({ _id: 'creds' });
   let creds = credsDoc?.data ? BufferJSON.reviver('', credsDoc.data) : null;
 
-  // ملاحظة: إن لم توجد creds سننشئ initAuthCreds، لكن هذا لا يعني "مسجّل دخول"
+  // لا تحفظ initAuthCreds في الداتابيس الآن — انتظر أول saveCreds
   if (!creds) {
     creds = initAuthCreds();
-    await cCol.updateOne(
-      { _id: 'creds' },
-      { $set: { data: BufferJSON.replacer('', creds), createdAt: Date.now() } },
-      { upsert: true }
-    );
-    logger?.info?.('Initialized fresh Baileys creds in MongoDB.');
+    logger?.info?.('Initialized fresh Baileys creds in memory (not persisted yet).');
   } else {
-    // أصلح أي حقول Binary → Buffer
     creds = deepFixBinary(creds);
   }
 
   // ---- key store (Signal keys) ----
   const keyStore = {
-    /** read */
     async get(type, ids) {
       const data = {};
       for (const id of ids) {
@@ -88,7 +81,6 @@ async function mongoAuthState(logger) {
       }
       return data;
     },
-    /** write */
     async set(data) {
       const ops = [];
       for (const category in data) {
@@ -105,18 +97,17 @@ async function mongoAuthState(logger) {
       }
       if (ops.length) await kCol.bulkWrite(ops, { ordered: false });
     },
-    /** delete */
     async remove(type, ids) {
       if (!ids?.length) return;
       await kCol.deleteMany({ _id: { $in: ids.map(id => `${type}-${id}`) } });
     }
   };
 
+  // تُستدعى عند كل creds.update — هنا فقط نُثبّت للـ DB
   async function saveCreds() {
-    // Baileys يستدعيها في creds.update (تتغير Counters/IDs…)
     await cCol.updateOne(
       { _id: 'creds' },
-      { $set: { data: BufferJSON.replacer('', creds), updatedAt: Date.now() } },
+      { $set: { data: BufferJSON.replacer('', creds), updatedAt: Date.now() }, $setOnInsert: { createdAt: Date.now() } },
       { upsert: true }
     );
   }
@@ -124,21 +115,15 @@ async function mongoAuthState(logger) {
   async function clearAuth() {
     await cCol.deleteMany({});
     await kCol.deleteMany({});
-    // بعد المسح ننشئ قالب جديد فقط (لا يعني دخول)
+    // لا نعيد حفظ initAuthCreds الآن؛ نكتفي بإبقائها في الذاكرة حتى أول creds.update
     creds = initAuthCreds();
-    await cCol.updateOne(
-      { _id: 'creds' },
-      { $set: { data: BufferJSON.replacer('', creds), createdAt: Date.now() } },
-      { upsert: true }
-    );
-    // لا نغلق client هنا، نفس العملية ستكمل
+    logger?.warn?.('Auth cleared from Mongo; fresh creds in memory (will persist on first saveCreds).');
   }
 
   return {
     state: { creds, keys: keyStore },
     saveCreds,
     clearAuth,
-    /** للمراقبة أو التشخيص */
     _client: client
   };
 }
