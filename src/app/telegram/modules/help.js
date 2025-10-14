@@ -1,4 +1,4 @@
-// src/app/telegram/modules/help.js
+'use strict';
 const { adminOnly } = require('../util');
 
 function helpText() {
@@ -52,7 +52,6 @@ function helpText() {
     '/g_banword_list 1203...@g.us',
     'عرض قائمة الكلمات المحظورة.',
     '',
-    // ⬇️ القسم الجديد: القائمة البيضاء
     '/g_wl_add 1203...@g.us 9677XXXXXXXX',
     'إضافة رقم (bare) إلى القائمة البيضاء — يُستثنى من الموديريشن.',
     '',
@@ -67,13 +66,12 @@ function helpText() {
   ].join('\n');
 }
 
-module.exports = function registerHelpCommand(ctx) {
-  ctx.bot.on('text', adminOnly(ctx, async (msg) => {
-    const [cmd] = (msg.text || '').trim().split(/\s+/);
-    if (!cmd) return;
-    const c = cmd.toLowerCase();
-    if (c === '/help' || c === '/commands') {
-      await ctx.bot.sendMessage(ctx.adminId, helpText(), { disable_web_page_preview: true });
-    }
-  }));
-};
+// دالة بصيغة يتوقعها الراوتر: handleHelp({ bot, msg })
+async function handleHelp({ bot, msg }) {
+  const send = adminOnly({ bot, adminId: process.env.TELEGRAM_ADMIN_ID }, async () => {
+    return bot.sendMessage(msg.chat.id, helpText(), { disable_web_page_preview: true });
+  });
+  return send(msg);
+}
+
+module.exports = { handleHelp, helpText };
