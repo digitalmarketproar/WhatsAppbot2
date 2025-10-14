@@ -132,6 +132,12 @@ async function createSocket({ telegram }) {
     _pairedOk = false;
   }
 
+  // 👇 مهم: لو الاعتماد موجود (me/registered)، اعتبره مقترن من البداية
+  if (state?.creds?.me || state?.creds?.registered) {
+    _pairedOk = true;
+    logger.info({ me: state?.creds?.me }, '🔐 existing creds detected — treating as already paired');
+  }
+
   const sock = makeWASocket({
     version,
     printQRInTerminal: QR_TO_CONSOLE,
@@ -143,16 +149,15 @@ async function createSocket({ telegram }) {
     browser: ['Ubuntu', 'Chrome', '22.04.4'],
   });
 
-  // عندما تتحدّث الاعتمادات وفيها me/registered نعتبره اقتران ناجح
+  // عند تحديث الاعتماد: علّم مقترن (إن توفّر) واحفظ الحالة
   sock.ev.on('creds.update', () => {
     try {
-      const c = sock?.authState?.creds || state?.creds;
+      const c = state?.creds;
       if (c?.me || c?.registered) {
         _pairedOk = true;
         logger.info({ me: c?.me }, '🔐 creds updated — pairing considered complete');
       }
     } catch {}
-    // احفظ الحالة الحالية (Baileys يعدّل نفس الكائن بالمرجع)
     saveCreds();
   });
 
@@ -203,7 +208,7 @@ async function createSocket({ telegram }) {
 
     if (connection === 'open') {
       logger.info('✅ WhatsApp connected.');
-      _pairedOk = true;           // اعتبره تم
+      _pairedOk = true;
       awaitingPairing = false;
       clearTimers();
     }
